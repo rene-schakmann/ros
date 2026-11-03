@@ -92,6 +92,52 @@ pub fn cpu_name() -> (&'static str, u64) {
     (implementer, (midr >> 4) & 0xfff)
 }
 
+/// Smallest data cache line size in bytes (`CTR_EL0.DminLine`).
+fn cache_line() -> u64 {
+    4 << ((read_sysreg!("CTR_EL0") >> 16) & 0xf)
+}
+
+/// Run the data cache operation `op` on every cache line in `addr..addr+len`.
+macro_rules! for_each_line {
+    ($op:literal, $addr:expr, $len:expr) => {{
+        let line = cache_line();
+        let end = $addr + $len as u64;
+        let mut a = $addr & !(line - 1);
+        while a < end {
+            // SAFETY: data cache maintenance by address only moves data
+            // between the cache and memory; it never changes its contents.
+            unsafe { asm!(concat!("dc ", $op, ", {}"), in(reg) a, options(nostack, preserves_flags)) };
+            a += line;
+        }
+        dsb();
+    }};
+}
+
+// DMA and caches
+// --------------
+// On the Raspberry Pi 5 the USB controller (behind the RP1 chip) is not
+// cache coherent: it reads and writes RAM directly, past the CPU caches.
+// So before a device reads memory the CPU wrote, the CPU must *clean*
+// (write back) those cache lines; before the CPU reads memory a device wrote,
+// it must *invalidate* its stale copies. Under QEMU and VirtualBox DMA is
+// coherent and these operations are cheap no-ops in effect.
+
+/// Write back cached data in `addr..addr+len` to memory, so a device sees it.
+pub fn dma_clean(addr: u64, len: usize) {
+    for_each_line!("cvac", addr, len);
+}
+
+/// Discard cached copies of `addr..addr+len`, so the CPU sees what a device
+/// wrote. The range must not hold CPU writes that weren't cleaned yet.
+pub fn dma_invalidate(addr: u64, len: usize) {
+    for_each_line!("ivac", addr, len);
+}
+
+/// Write back and discard cached data in `addr..addr+len`.
+pub fn dma_clean_invalidate(addr: u64, len: usize) {
+    for_each_line!("civac", addr, len);
+}
+
 // PSCI (Power State Coordination Interface): the standard ARM firmware call
 // for power management. We trap into the hypervisor with `hvc` (or into secure
 // firmware with `smc`), which then powers off or resets the machine.
@@ -99,6 +145,9 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 
 fn psci_call(function: u64, use_hvc: bool) {
+    // At EL2 we *are* the hypervisor: `hvc` would trap into our own vectors,
+    // so the call must go to the secure firmware (EL3) with `smc`.
+    let use_hvc = use_hvc && current_el() < 2;
     // SAFETY: SYSTEM_OFF / SYSTEM_RESET don't return on success; on failure
     // the firmware clobbers at most x0-x3, which are declared as outputs.
     unsafe {

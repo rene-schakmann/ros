@@ -31,6 +31,42 @@ $(IMG): $(EFI) startup.nsh
 	dd if=$(BUILD)/esp.img of=$@ bs=512 seek=$(ESP_START) conv=notrunc status=none
 	rm -f $(BUILD)/esp.img
 
+# Raspberry Pi 5 SD card image: MBR, one FAT32 partition with the community
+# UEFI firmware (worproject/rpi5-uefi: TF-A + EDK2, provides ACPI) and ROS at
+# the default boot path. The firmware is downloaded and checked against a
+# pinned SHA-256; it is not part of this repository.
+RPI5_FW_VERSION := v0.3
+RPI5_FW_URL     := https://github.com/worproject/rpi5-uefi/releases/download/$(RPI5_FW_VERSION)/RPi5_UEFI_Release_$(RPI5_FW_VERSION).zip
+RPI5_FW_SHA256  := 2337df318845448ebcc8a6a587d15dccec44b54c665ece21250d2f6170732724
+RPI5_FW_ZIP     := $(BUILD)/rpi5-uefi-$(RPI5_FW_VERSION).zip
+RPI5_DIR        := $(BUILD)/rpi5
+RPI5_IMG        := $(BUILD)/ros-rpi5.img
+
+rpi5: $(RPI5_IMG)
+
+$(RPI5_FW_ZIP):
+	mkdir -p $(BUILD)
+	curl -fsSL -o $@.download $(RPI5_FW_URL)
+	echo "$(RPI5_FW_SHA256)  $@.download" | sha256sum -c --quiet -
+	mv $@.download $@
+
+# build/rpi5/ holds the files to copy onto any FAT32-formatted SD card;
+# build/ros-rpi5.img is the same as a ready-to-flash disk image.
+$(RPI5_IMG): $(EFI) $(RPI5_FW_ZIP) startup.nsh
+	rm -rf $(RPI5_DIR) $@ $(BUILD)/rpi5-fat.img
+	mkdir -p $(RPI5_DIR)/EFI/BOOT
+	unzip -q $(RPI5_FW_ZIP) -d $(RPI5_DIR)
+	cp $(EFI) $(RPI5_DIR)/EFI/BOOT/BOOTAA64.EFI
+	cp startup.nsh $(RPI5_DIR)/
+	truncate -s 64M $@
+	printf 'label: dos\nstart=$(ESP_START), size=$(ESP_SECTORS), type=c, bootable\n' | sfdisk -q $@
+	truncate -s $$(( $(ESP_SECTORS) * 512 )) $(BUILD)/rpi5-fat.img
+	mkfs.fat -F 32 -s 1 -n ROS $(BUILD)/rpi5-fat.img >/dev/null
+	mcopy -s -i $(BUILD)/rpi5-fat.img $(RPI5_DIR)/* ::/
+	dd if=$(BUILD)/rpi5-fat.img of=$@ bs=512 seek=$(ESP_START) conv=notrunc status=none
+	rm -f $(BUILD)/rpi5-fat.img
+	@echo "Raspberry Pi 5 image: $@ (files for an SD card: $(RPI5_DIR)/)"
+
 # Formatting, lints (kernel and unit tests) and documentation.
 check:
 	cargo fmt --check
@@ -59,4 +95,4 @@ screenshots: $(IMG)
 clean:
 	rm -rf $(BUILD) target
 
-.PHONY: all check fmt test smoke qemu screenshots clean $(EFI)
+.PHONY: all rpi5 check fmt test smoke qemu screenshots clean $(EFI)

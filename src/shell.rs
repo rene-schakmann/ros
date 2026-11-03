@@ -3,9 +3,10 @@
 //! Commands are listed once in [`COMMANDS`]; that table drives dispatch,
 //! `help` and tab completion. To add a command, add a row and a handler.
 
-use crate::acpi::Platform;
+use crate::acpi::{Board, Platform};
 use crate::arch;
 use crate::console::{self, PALETTE, color, cprint, print, println};
+use crate::interrupts::Gic;
 use crate::interrupts::{self, uptime_ms};
 use crate::keyboard::{self, Key, Layout, USB};
 use crate::memory::{self, kind};
@@ -196,6 +197,8 @@ impl Shell {
         let usb = USB.lock();
         let row = |label: &str| cprint!(color::LIGHT_CYAN, "  {label:<9}");
         cprint!(color::WHITE, "ROS v{VERSION} - a tiny AArch64 operating system in Rust\n");
+        row("Board");
+        println!("{}", p.board.name());
         row("CPU");
         println!("{vendor} part {part:#x}, running at EL{}", arch::current_el());
         row("Timer");
@@ -206,20 +209,32 @@ impl Shell {
             interrupts::TICK_HZ
         );
         row("GIC");
-        println!("GICv3, distributor {:#x}, redistributors {:#x}", p.gicd, p.gicr);
+        match p.gic() {
+            Ok(Gic::V2 { gicd, gicc }) => println!("GICv2, distributor {gicd:#x}, CPU interface {gicc:#x}"),
+            Ok(Gic::V3 { gicd, gicr }) => println!("GICv3, distributor {gicd:#x}, redistributors {gicr:#x}"),
+            Err(e) => println!("{e}"),
+        }
         row("PCI");
-        println!(
-            "ECAM {:#x}, buses {}-{}, {} devices",
-            p.pci_ecam,
-            p.pci_bus_start,
-            p.pci_bus_end,
-            self.pci.len()
-        );
+        if p.board == Board::RaspberryPi5 {
+            println!("not scanned (Broadcom PCIe is not ECAM compliant)");
+        } else {
+            println!(
+                "ECAM {:#x}, buses {}-{}, {} devices",
+                p.pci_ecam,
+                p.pci_bus_start,
+                p.pci_bus_end,
+                self.pci.len()
+            );
+        }
         row("USB");
-        match usb.as_ref() {
-            Some(x) => {
-                println!("xHCI {}.{}, {} devices", x.version >> 8, (x.version >> 4) & 0xf, x.devices.len());
-            }
+        match usb.first() {
+            Some(x) => println!(
+                "{} xHCI {}.{} controller(s), {} devices",
+                usb.len(),
+                x.version >> 8,
+                (x.version >> 4) & 0xf,
+                usb.iter().map(|x| x.devices.len()).sum::<usize>()
+            ),
             None => println!("no controller"),
         }
         row("Screen");
@@ -234,6 +249,9 @@ impl Shell {
     }
 
     fn lspci(&self) {
+        if self.pci.is_empty() {
+            println!("no PCI devices found");
+        }
         for d in &self.pci {
             cprint!(color::LIGHT_CYAN, "{:02x}:{:02x}.{} ", d.bus, d.dev, d.func);
             println!("[{:04x}:{:04x}] {} - {}", d.vendor, d.device, d.class_name(), d.vendor_name());
@@ -372,14 +390,14 @@ fn memmap() {
 
 fn lsusb() {
     let usb = USB.lock();
-    let Some(x) = usb.as_ref() else {
+    if usb.is_empty() {
         return println!("no USB controller");
-    };
-    if x.devices.is_empty() {
+    }
+    if usb.iter().all(|x| x.devices.is_empty()) {
         println!("no USB devices");
     }
-    for d in &x.devices {
-        cprint!(color::LIGHT_CYAN, "port {} slot {} ", d.port, d.slot);
+    for (bus, d) in usb.iter().enumerate().flat_map(|(i, x)| x.devices.iter().map(move |d| (i + 1, d))) {
+        cprint!(color::LIGHT_CYAN, "bus {bus} port {} slot {} ", d.port, d.slot);
         print!(
             "[{:04x}:{:04x}] {}",
             d.vendor,

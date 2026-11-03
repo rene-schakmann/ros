@@ -14,6 +14,11 @@
 //!
 //! Everything is polled; the controller's interrupts stay unused.
 //!
+//! The controller reads and writes RAM directly (DMA). On the Raspberry Pi 5
+//! that DMA bypasses the CPU caches, so the driver *cleans* every structure it
+//! hands to the controller and *invalidates* everything before reading what
+//! the controller wrote (see `arch::dma_clean`). Each place is marked "DMA:".
+//!
 //! References: eXtensible Host Controller Interface for USB, revision 1.2
 //! (xHCI spec); USB 2.0 specification, chapter 9; HID 1.11, appendix B.
 
@@ -64,6 +69,7 @@ const USBSTS_NOT_READY: u32 = 1 << 11;
 const PORT_CONNECTED: u32 = 1 << 0;
 const PORT_ENABLED: u32 = 1 << 1;
 const PORT_RESET: u32 = 1 << 4;
+const PORT_POWER: u32 = 1 << 9;
 const PORT_RESET_CHANGE: u32 = 1 << 21;
 /// Bits that must be written back unchanged; everything else is either
 /// "write 1 to clear" or would disable the port if we wrote 1.
@@ -135,9 +141,10 @@ impl Ring {
             write64(addr, param);
             write32(addr + 8, status);
             // The controller may be reading the ring right now: make sure the
-            // TRB contents are visible before flipping its cycle bit.
-            arch::dsb();
+            // TRB contents reach memory before flipping its cycle bit.
+            arch::dma_clean(addr, 16); // DMA: includes a barrier
             write32(addr + 12, control);
+            arch::dma_clean(addr, 16); // DMA
         }
     }
 
@@ -171,6 +178,7 @@ struct EventRing {
 impl EventRing {
     fn pop(&mut self) -> Option<Trb> {
         let addr = self.base + self.index as u64 * 16;
+        arch::dma_invalidate(addr, 16); // DMA: see what the controller wrote
         // SAFETY: `addr` is a TRB slot inside the event ring segment we allocated.
         let control = unsafe { read32(addr + 12) };
         if control & 1 != self.cycle {
@@ -300,7 +308,9 @@ impl Xhci {
                     *((array + i * 8) as *mut u64) = alloc_page();
                 }
                 *(dcbaa as *mut u64) = array;
+                arch::dma_clean(array, scratchpads as usize * 8); // DMA
             }
+            arch::dma_clean(dcbaa, 8); // DMA
             write64(op + DCBAAP, dcbaa);
 
             // 4. Command ring.
@@ -313,6 +323,7 @@ impl Xhci {
             let table = alloc_page();
             *(table as *mut u64) = segment;
             *((table + 8) as *mut u32) = RING_TRBS as u32;
+            arch::dma_clean(table, 16); // DMA
             let interrupter = runtime + 0x20;
             write32(interrupter + 0x08, 1); // ERSTSZ: table size
             write64(interrupter + 0x18, segment); // ERDP: dequeue pointer
@@ -370,7 +381,11 @@ impl Xhci {
         }
     }
 
+    /// Run a command; `param` is 0 or the address of an input context page.
     fn command(&mut self, param: u64, control: u32) -> Result<Trb, u8> {
+        if param != 0 {
+            arch::dma_clean(param, 4096); // DMA: the input context we filled in
+        }
         let addr = self.commands.push(param, 0, control);
         self.ring_doorbell(0, 0); // doorbell 0 = the command ring
         loop {
@@ -447,6 +462,7 @@ impl Xhci {
             buffer,
             len,
         )?;
+        arch::dma_invalidate(buffer, len as usize); // DMA: see what the device sent
         // SAFETY: `buffer` is a 4 KiB page we own (len <= 4096), and the
         // controller has finished writing to it (status stage completed).
         Ok(unsafe { core::slice::from_raw_parts(buffer as *const u8, len as usize) }.to_vec())
@@ -454,7 +470,22 @@ impl Xhci {
 
     /// Reset every port with something plugged in and set the device up.
     pub fn enumerate(&mut self) {
-        delay_ms(50); // give devices time to report their connection
+        // Ports start unpowered after a reset if the controller supports port
+        // power control (the Raspberry Pi 5's does). Power them all first.
+        let mut powered_up = false;
+        for port in 1..=self.max_ports {
+            let reg = self.portsc(port);
+            // SAFETY: PORTSC of an existing port; we only add the power bit.
+            unsafe {
+                let status = read32(reg);
+                if status & PORT_POWER == 0 {
+                    write32(reg, (status & PORT_PRESERVE) | PORT_POWER);
+                    powered_up = true;
+                }
+            }
+        }
+        // Give devices time to power up and report their connection.
+        delay_ms(if powered_up { 300 } else { 50 });
         for port in 1..=self.max_ports {
             // SAFETY: PORTSC of an existing port (1..=max_ports).
             let status = unsafe { read32(self.portsc(port)) };
@@ -500,8 +531,10 @@ impl Xhci {
         // Output context: written by the controller. Input context: our requests.
         let output = alloc_page();
         let input = alloc_page();
+        let entry = self.dcbaa + slot as u64 * 8;
         // SAFETY: `dcbaa` is our page with one u64 entry per slot (slot < 256).
-        unsafe { *((self.dcbaa + slot as u64 * 8) as *mut u64) = output };
+        unsafe { *(entry as *mut u64) = output };
+        arch::dma_clean(entry, 8); // DMA
         let mut ep0 = Ring::new();
 
         // Address Device: the controller assigns a USB address and sets up endpoint 0.
@@ -665,6 +698,7 @@ impl Xhci {
         }
         if matches!(event.code(), SUCCESS | SHORT_PACKET) {
             let mut report = [0u8; 8];
+            arch::dma_invalidate(kb.buffer, 8); // DMA: see the new report
             // SAFETY: `buffer` is the keyboard's DMA page, and the transfer is complete.
             unsafe { core::ptr::copy_nonoverlapping(kb.buffer as *const u8, report.as_mut_ptr(), 8) };
             self.reports.push_back(report);

@@ -11,6 +11,11 @@ use spin::Mutex;
 /// Size of one page / frame in bytes.
 pub const PAGE_SIZE: u64 = 4096;
 
+/// Pages are preferably taken below this address. The Raspberry Pi 5's RP1
+/// USB controllers can only reach the first 3 GiB of RAM; virtual machines
+/// don't care, but there is plenty of low memory everywhere.
+pub const DMA_LIMIT: u64 = 0xC000_0000;
+
 // In unit tests on the host, the system allocator is used instead.
 #[cfg_attr(not(test), global_allocator)]
 static HEAP: LockedHeap = LockedHeap::empty();
@@ -91,9 +96,14 @@ impl FrameAllocator {
         FrameAllocator { free: Vec::new(), used_pages: 0 }
     }
 
-    /// Take `pages` contiguous pages from the first region big enough.
+    /// Take `pages` contiguous pages from the first region big enough,
+    /// preferring memory below [`DMA_LIMIT`].
     fn take(&mut self, pages: u64) -> Option<u64> {
-        let region = self.free.iter_mut().find(|r| r.pages >= pages)?;
+        let fits = |r: &Region| r.pages >= pages;
+        let low = |r: &Region| r.start + pages * PAGE_SIZE <= DMA_LIMIT;
+        let index =
+            (self.free.iter().position(|r| fits(r) && low(r))).or_else(|| self.free.iter().position(fits))?;
+        let region = &mut self.free[index];
         let addr = region.start;
         region.start += pages * PAGE_SIZE;
         region.pages -= pages;
@@ -122,6 +132,9 @@ pub fn init_frames(map: Vec<Region>) {
 
 /// Allocate `pages` contiguous, zeroed pages. Returns the physical address.
 ///
+/// The pages are meant for device DMA: the zeros are written back from the
+/// CPU cache to memory, so a non-coherent device sees them too.
+///
 /// # Panics
 /// Panics when no free region is large enough.
 pub fn alloc_pages(pages: u64) -> u64 {
@@ -129,6 +142,7 @@ pub fn alloc_pages(pages: u64) -> u64 {
     // SAFETY: the pages come from CONVENTIONAL memory that nobody else uses
     // and are identity mapped, so the physical address is a valid pointer.
     unsafe { core::ptr::write_bytes(addr as *mut u8, 0, (pages * PAGE_SIZE) as usize) };
+    crate::arch::dma_clean_invalidate(addr, (pages * PAGE_SIZE) as usize);
     addr
 }
 
@@ -204,6 +218,17 @@ mod tests {
         assert_eq!(f.take(1), None);
         assert_eq!(f.used_pages, 5);
         assert_eq!(f.free_bytes(), 0);
+    }
+
+    #[test]
+    fn frame_allocator_prefers_dma_reachable_memory() {
+        let mut f = FrameAllocator::new();
+        f.free = vec![
+            Region { kind: kind::CONVENTIONAL, start: 0x1_0000_0000, pages: 16 }, // above 4 GiB
+            Region { kind: kind::CONVENTIONAL, start: DMA_LIMIT - 0x2000, pages: 2 },
+        ];
+        assert_eq!(f.take(2), Some(DMA_LIMIT - 0x2000));
+        assert_eq!(f.take(1), Some(0x1_0000_0000)); // low memory used up: fall back
     }
 
     #[test]

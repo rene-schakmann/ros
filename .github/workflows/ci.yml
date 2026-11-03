@@ -37,8 +37,13 @@ jobs:
       - run: make -f build.mk test
 
   smoke:
-    name: Boot test (QEMU)
+    name: Boot test (QEMU, ${{ matrix.profile }})
     runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        # gicv3: like VirtualBox. gicv2-el2: GIC-400 and EL2, like the Raspberry Pi 5.
+        profile: [gicv3, gicv2-el2]
     steps:
       - uses: actions/checkout@v7
       - name: Install image tools and QEMU
@@ -53,8 +58,10 @@ jobs:
       - name: Boot and test the shell
         run: make -f build.mk smoke
         env:
+          PROFILE: ${{ matrix.profile }}
           TIMEOUT: "300"
       - name: Upload disk image
+        if: matrix.profile == 'gicv3'
         uses: actions/upload-artifact@v7
         with:
           name: ros-image
@@ -62,6 +69,21 @@ jobs:
             build/ros.img
             target/aarch64-unknown-uefi/release/ros.efi
           retention-days: 14
+
+  rpi5:
+    name: Raspberry Pi 5 image
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mtools dosfstools fdisk unzip
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      # Only checks that the image builds. It contains third-party firmware,
+      # so it is not uploaded; users build it themselves with `make rpi5`.
+      - run: make -f build.mk rpi5
 
   docker:
     name: Docker build environment

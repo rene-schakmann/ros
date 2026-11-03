@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-03
+
+### Added
+
+- **Raspberry Pi 5 support (experimental)** on the community UEFI firmware
+  (worproject/rpi5-uefi). `make rpi5` builds an SD card image; the README
+  explains how to flash and boot it.
+- Running at EL2: separate exception vector tables for EL1 and EL2, interrupt
+  routing to EL2, PSCI via `smc` from EL2.
+- GICv2 interrupt controller driver (the Pi 5's GIC-400), chosen from the MADT.
+- USB controllers described in ACPI instead of PCI (the Pi 5's RP1 xHCI
+  controllers), and support for several USB controllers at once.
+- Cache maintenance for non-coherent DMA (xHCI rings, contexts, buffers) and
+  for the framebuffer. DMA buffers prefer memory below 3 GiB.
+- UART discovery through the ACPI SPCR table (DSDT search as fallback).
+- xHCI port power-on for controllers with port power control.
+- `PROFILE=gicv2-el2 make smoke`: QEMU boot test with GICv2 at EL2, run in CI
+  next to the GICv3/EL1 profile. CI also builds the Pi 5 image.
+- `sysinfo` shows the board; `lsusb` lists devices per controller.
+
+### Fixed
+
+- The MADT GICC entry's redistributor base was read from the MPIDR field
+  (offset 68 instead of 60). It only mattered for firmware without a GICR entry.
+- An ACPI error at boot is now shown on screen (the console starts first).
+
 ## [0.3.0] - 2026-11-03
 
 First public release.
@@ -53,5 +79,6 @@ First public release.
 - USB keyboard via xHCI, GICv3 interrupts, ARM generic timer, ACPI discovery,
   PCI enumeration, framebuffer console, shell with history and tab completion.
 
-[Unreleased]: https://github.com/rene-schakmann/ros/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rene-schakmann/ros/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rene-schakmann/ros/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rene-schakmann/ros/releases/tag/v0.3.0

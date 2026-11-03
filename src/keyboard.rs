@@ -11,6 +11,7 @@ use crate::interrupts::uptime_ms;
 use crate::serial;
 use crate::xhci::Xhci;
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use spin::Mutex;
 
 /// A key press, after applying the keyboard layout.
@@ -50,8 +51,9 @@ const REPEAT_RATE_MS: u64 = 40;
 /// Usage ID reported in all six key slots when too many keys are pressed.
 const ERROR_ROLL_OVER: u8 = 0x01;
 
-/// The USB controller with the keyboard (set up by `kernel_main`).
-pub static USB: Mutex<Option<Xhci>> = Mutex::new(None);
+/// The running USB controllers (set up by `kernel_main`). A Raspberry Pi 5
+/// has two, each serving one USB 2 and one USB 3 port.
+pub static USB: Mutex<Vec<Xhci>> = Mutex::new(Vec::new());
 
 #[derive(Debug)]
 struct State {
@@ -77,7 +79,7 @@ pub fn layout() -> Layout {
 /// Next key press, if any. Never blocks.
 pub fn poll() -> Option<Key> {
     let mut state = STATE.lock();
-    if let Some(usb) = USB.lock().as_mut() {
+    for usb in USB.lock().iter_mut() {
         while let Some(report) = usb.poll() {
             state.on_report(&report);
         }

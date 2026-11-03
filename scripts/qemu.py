@@ -15,6 +15,9 @@ Only the Python standard library is used. Environment variables:
     QEMU_EFI    UEFI firmware image (default: searched in common locations)
     ROS_IMAGE   disk image (default: build/ros.img)
     TIMEOUT     seconds to wait for each step (default: 120)
+    PROFILE     machine profile (default: gicv3):
+                  gicv3      GICv3, firmware hands over at EL1 (like VirtualBox)
+                  gicv2-el2  GICv2, firmware hands over at EL2 (like the Raspberry Pi 5)
 """
 
 import json
@@ -33,6 +36,15 @@ ROOT = Path(__file__).resolve().parent.parent
 IMAGE = Path(os.environ.get("ROS_IMAGE", ROOT / "build" / "ros.img"))
 TIMEOUT = float(os.environ.get("TIMEOUT", "120"))
 PROMPT = "rene@ros:~$ "
+
+PROFILES = {
+    "gicv3": {"machine": "virt,gic-version=3", "el": 1, "gic": 3},
+    "gicv2-el2": {"machine": "virt,gic-version=2,virtualization=on", "el": 2, "gic": 2},
+}
+PROFILE_NAME = os.environ.get("PROFILE", "gicv3")
+if PROFILE_NAME not in PROFILES:
+    sys.exit(f"error: unknown PROFILE {PROFILE_NAME!r}; choose one of {', '.join(PROFILES)}")
+PROFILE = PROFILES[PROFILE_NAME]
 
 FIRMWARE_CANDIDATES = [
     "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",  # Debian, Ubuntu
@@ -63,7 +75,7 @@ def qemu_command(extra: list[str]) -> list[str]:
         sys.exit(f"error: {IMAGE} not found; build it first (make image)")
     return [
         os.environ.get("QEMU", "qemu-system-aarch64"),
-        "-machine", "virt,gic-version=3",
+        "-machine", PROFILE["machine"],
         "-cpu", "cortex-a72",
         "-m", "1024",
         "-bios", firmware(),
@@ -179,18 +191,21 @@ def boot(machine: Machine) -> str:
 
 
 def test() -> None:
+    print(f"profile {PROFILE_NAME}: -machine {PROFILE['machine']}")
     machine = Machine()
     try:
         out = boot(machine)
         check("ROS kernel started, firmware exited" in out, "kernel took over from UEFI", out)
-        for line in ["exception vectors installed", "GICv3 interrupt controller", "PCI:", "USB keyboard ready"]:
+        for line in ["exception vectors installed", "PCI:", "USB keyboard ready"]:
             check(f"[ ok ] {line}" in out, f"boot step: {line}", out)
         check("[fail]" not in out, "no failed boot steps", out)
+        check(f"running at EL{PROFILE['el']}" in out, f"kernel runs at EL{PROFILE['el']}", out)
+        check(f"GICv{PROFILE['gic']} interrupt controller" in out, f"GICv{PROFILE['gic']} driver", out)
 
         out = machine.run("echo hello from the USB keyboard")
         check("hello from the USB keyboard" in out, "USB keyboard input and echo", out)
         out = machine.run("sysinfo")
-        check("GICv3, distributor" in out and "PL011 UART" in out, "sysinfo shows hardware", out)
+        check(f"GICv{PROFILE['gic']}, distributor" in out and "PL011 UART" in out, "sysinfo shows hardware", out)
         out = machine.run("lsusb")
         check("keyboard" in out, "lsusb lists the keyboard", out)
         out = machine.run("uptime")

@@ -8,6 +8,7 @@ all: image
 
 help:
 	@echo "make image        build build/ros.img (GPT disk with the kernel as BOOTAA64.EFI)"
+	@echo "make rpi5         build build/ros-rpi5.img, an SD card image for the Raspberry Pi 5"
 	@echo "make qemu         boot in QEMU, serial console in this terminal (Ctrl-A X quits)"
 	@echo "make run          boot in VirtualBox (Apple Silicon)"
 	@echo "make log          follow the VirtualBox VM's serial log"
@@ -25,8 +26,12 @@ docker:
 image: docker
 	$(call DOCKER_RUN) make -f build.mk
 
-test check fmt smoke screenshots: docker
+test check fmt rpi5 screenshots: docker
 	$(call DOCKER_RUN) make -f build.mk $@
+
+# PROFILE=gicv2-el2 make smoke tests the Raspberry Pi 5 code paths in QEMU.
+smoke: docker
+	$(call DOCKER_RUN,-e PROFILE) make -f build.mk smoke
 
 qemu: docker
 	$(call DOCKER_RUN,-it) make -f build.mk qemu
@@ -51,4 +56,4 @@ clean:
 	-./scripts/mkvm.sh destroy
 	rm -rf build target
 
-.PHONY: all help docker image test check fmt smoke screenshots qemu vdi vm run log clean
+.PHONY: all help docker image rpi5 test check fmt smoke screenshots qemu vdi vm run log clean

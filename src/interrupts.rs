@@ -1,17 +1,20 @@
-//! Interrupts: the GICv3 interrupt controller and the ARM generic timer.
+//! Interrupts: the GIC interrupt controller and the ARM generic timer.
 //!
 //! Devices signal the GIC ("Generic Interrupt Controller"); the GIC decides
 //! which interrupt goes to the CPU; the CPU jumps to our IRQ vector. We use it
 //! for a 100 Hz timer tick, which also wakes the CPU from `wfi` so the shell
 //! can poll the keyboard without burning CPU time.
 //!
-//! The GIC has three parts:
-//! - the *distributor* (GICD, one per system) routes shared interrupts,
-//! - one *redistributor* (GICR) per CPU handles private interrupts (PPIs),
-//!   such as the timer,
-//! - the *CPU interface* is accessed through `ICC_*` system registers.
+//! Two GIC generations are supported, as reported by the ACPI MADT:
 //!
-//! Reference: Arm GICv3/v4 Architecture Specification (IHI 0069).
+//! - **GICv3** (QEMU, VirtualBox): a *distributor* (GICD) for shared
+//!   interrupts, one *redistributor* (GICR) per CPU for private interrupts
+//!   (PPIs) such as the timer, and a CPU interface in `ICC_*` system registers.
+//! - **GICv2** (Raspberry Pi 5's GIC-400): a distributor that also handles
+//!   PPIs, and a memory-mapped CPU interface (GICC).
+//!
+//! References: Arm GICv3/v4 Architecture Specification (IHI 0069),
+//! Arm GICv2 Architecture Specification (IHI 0048).
 
 use crate::arch::{self, read_sysreg, write_sysreg};
 use crate::mmio::{read32, read64, write8, write32};
@@ -24,14 +27,47 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 static TIMER_IRQ: AtomicU64 = AtomicU64::new(27);
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
 static BOOT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// GICv2 CPU interface base; 0 means the GICv3 system register interface.
+static GICC_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Which interrupt controller to drive, with its register bases from ACPI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gic {
+    /// GICv2: distributor and memory-mapped CPU interface.
+    V2 {
+        /// Distributor base.
+        gicd: u64,
+        /// CPU interface base.
+        gicc: u64,
+    },
+    /// GICv3: distributor and redistributors.
+    V3 {
+        /// Distributor base.
+        gicd: u64,
+        /// First redistributor frame.
+        gicr: u64,
+    },
+}
 
 // Distributor registers (global, shared by all CPUs).
 const GICD_CTLR: u64 = 0x0000;
+const GICD_CTLR_ENABLE: u32 = 1 << 0; // GICv2: enable (group 0 / non-secure group 1)
 const GICD_CTLR_ENABLE_GRP1: u32 = 1 << 1;
-const GICD_CTLR_ARE: u32 = 1 << 4; // affinity routing enable
-const GICD_CTLR_RWP: u32 = 1 << 31; // register write pending
+const GICD_CTLR_ARE: u32 = 1 << 4; // GICv3: affinity routing enable
+const GICD_CTLR_RWP: u32 = 1 << 31; // GICv3: register write pending
+const GICD_ISENABLER0: u64 = 0x0100; // GICv2: banked per CPU for SGIs/PPIs
+const GICD_IPRIORITYR: u64 = 0x0400;
 
-// Redistributor registers (one frame per CPU): control frame + SGI/PPI frame.
+// GICv2 CPU interface registers.
+const GICC_CTLR: u64 = 0x0000;
+const GICC_CTLR_ENABLE: u32 = 1 << 0;
+const GICC_PMR: u64 = 0x0004;
+const GICC_BPR: u64 = 0x0008;
+const GICC_IAR: u64 = 0x000c;
+const GICC_EOIR: u64 = 0x0010;
+const GICC_IAR_ID_MASK: u64 = 0x3ff;
+
+// GICv3 redistributor registers (one frame per CPU): control frame + SGI/PPI frame.
 const GICR_TYPER: u64 = 0x0008;
 const GICR_TYPER_LAST: u64 = 1 << 4;
 const GICR_WAKER: u64 = 0x0014;
@@ -42,6 +78,12 @@ const GICR_SGI: u64 = 0x10000;
 const GICR_IGROUPR0: u64 = GICR_SGI + 0x0080;
 const GICR_ISENABLER0: u64 = GICR_SGI + 0x0100;
 const GICR_IPRIORITYR: u64 = GICR_SGI + 0x0400;
+
+/// HCR_EL2 bits that route physical FIQ, IRQ and SError to EL2.
+const HCR_EL2_FMO_IMO_AMO: u64 = (1 << 3) | (1 << 4) | (1 << 5);
+
+/// Priority for the timer: middle of the range, so the mask (0xff) lets it through.
+const TIMER_PRIORITY: u8 = 0x80;
 
 /// Interrupt IDs 1020-1023 are special ("spurious": nothing to handle).
 const SPURIOUS_INTID: u64 = 1020;
@@ -65,18 +107,15 @@ unsafe fn find_redistributor(gicr: u64) -> u64 {
     }
 }
 
-/// Set up the GIC and start the timer. Interrupts stay masked until
-/// [`arch::enable_irqs`] is called.
+/// GICv3: enable the distributor, wake our redistributor, enable the timer
+/// PPI and turn on the system register CPU interface.
 ///
 /// # Safety
-/// `gicd` and `gicr` must be the GICv3 distributor and redistributor bases
-/// from ACPI, the exception vectors must be installed, and this must be
-/// called once, on the boot CPU.
-pub unsafe fn init(gicd: u64, gicr: u64, timer_irq: u32) {
-    TIMER_IRQ.store(timer_irq as u64, Ordering::Relaxed);
-
+/// `gicd`/`gicr` must be the GICv3 register frames from ACPI.
+unsafe fn init_gicv3(gicd: u64, gicr: u64, irq: u32) {
     // SAFETY: `gicd`/`gicr` are the GIC register frames (caller guarantees),
-    // and all offsets below are architected GICv3 registers.
+    // and all offsets below are architected GICv3 registers. The CPU
+    // interface only affects interrupt delivery, which is still masked.
     unsafe {
         // Distributor: enable affinity routing and group 1 interrupts.
         let ctlr = read32(gicd + GICD_CTLR);
@@ -89,17 +128,14 @@ pub unsafe fn init(gicd: u64, gicr: u64, timer_irq: u32) {
         write32(rd + GICR_WAKER, read32(rd + GICR_WAKER) & !GICR_WAKER_PROCESSOR_SLEEP);
         while read32(rd + GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 {}
 
-        let bit = 1u32 << timer_irq;
+        let bit = 1u32 << irq;
         write32(rd + GICR_IGROUPR0, read32(rd + GICR_IGROUPR0) | bit);
-        write8(rd + GICR_IPRIORITYR + timer_irq as u64, 0x80);
+        write8(rd + GICR_IPRIORITYR + irq as u64, TIMER_PRIORITY);
         write32(rd + GICR_ISENABLER0, bit);
-    }
 
-    // SAFETY: programming the CPU interface and the virtual timer only affects
-    // interrupt delivery, which is still masked (DAIF.I) at this point.
-    unsafe {
         // CPU interface: enable system register access, allow all priorities,
-        // enable group 1.
+        // enable group 1. (ICC_*_EL1 registers also serve EL2 when ICC_SRE_EL2.SRE=1,
+        // which the firmware sets.)
         write_sysreg!("S3_0_C12_C12_5", read_sysreg!("S3_0_C12_C12_5") | 1); // ICC_SRE_EL1.SRE
         arch::isb();
         write_sysreg!("S3_0_C4_C6_0", 0xff); // ICC_PMR_EL1: priority mask
@@ -107,6 +143,60 @@ pub unsafe fn init(gicd: u64, gicr: u64, timer_irq: u32) {
         write_sysreg!("S3_0_C12_C12_4", read_sysreg!("S3_0_C12_C12_4") & !2); // ICC_CTLR_EL1: EOI also deactivates
         write_sysreg!("S3_0_C12_C12_7", 1); // ICC_IGRPEN1_EL1: enable group 1
         arch::isb();
+    }
+}
+
+/// GICv2: enable the distributor and CPU interface and the timer PPI.
+///
+/// Interrupt groups are left as the firmware configured them (all non-secure
+/// on a Raspberry Pi with TF-A; group 0 on QEMU without security extensions).
+/// Writing 1 to the enable bits turns on whichever group we can see, which
+/// is the same thing Linux does.
+///
+/// # Safety
+/// `gicd`/`gicc` must be the GICv2 register frames from ACPI.
+unsafe fn init_gicv2(gicd: u64, gicc: u64, irq: u32) {
+    // SAFETY: `gicd`/`gicc` are the GIC register frames (caller guarantees),
+    // and all offsets below are architected GICv2 registers.
+    unsafe {
+        write32(gicd + GICD_CTLR, read32(gicd + GICD_CTLR) | GICD_CTLR_ENABLE);
+        write8(gicd + GICD_IPRIORITYR + irq as u64, TIMER_PRIORITY);
+        write32(gicd + GICD_ISENABLER0, 1 << irq);
+
+        write32(gicc + GICC_PMR, 0xff);
+        write32(gicc + GICC_BPR, 0);
+        write32(gicc + GICC_CTLR, read32(gicc + GICC_CTLR) | GICC_CTLR_ENABLE);
+    }
+    GICC_BASE.store(gicc, Ordering::Relaxed);
+}
+
+/// Set up the GIC and start the timer. Interrupts stay masked until
+/// [`arch::enable_irqs`] is called.
+///
+/// # Safety
+/// The addresses in `gic` must be the GIC register frames from ACPI, the
+/// exception vectors must be installed, and this must be called once, on
+/// the boot CPU.
+pub unsafe fn init(gic: Gic, timer_irq: u32) {
+    TIMER_IRQ.store(timer_irq as u64, Ordering::Relaxed);
+
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        match gic {
+            Gic::V2 { gicd, gicc } => init_gicv2(gicd, gicc, timer_irq),
+            Gic::V3 { gicd, gicr } => init_gicv3(gicd, gicr, timer_irq),
+        }
+    }
+
+    // SAFETY: routing interrupts to our own exception level and arming the
+    // virtual timer only affect interrupt delivery, which is still masked.
+    unsafe {
+        if arch::current_el() == 2 {
+            // At EL2, physical interrupts are only taken if they are routed
+            // to EL2; otherwise they would target EL1 and stay pending forever.
+            write_sysreg!("HCR_EL2", read_sysreg!("HCR_EL2") | HCR_EL2_FMO_IMO_AMO);
+            arch::isb();
+        }
 
         // Generic timer: counts at CNTFRQ Hz. Fires when the count reaches CVAL.
         let interval = timer_frequency() / TICK_HZ;
@@ -118,9 +208,35 @@ pub unsafe fn init(gicd: u64, gicr: u64, timer_irq: u32) {
     }
 }
 
+/// Acknowledge the highest priority pending interrupt. Returns the raw
+/// acknowledge value (needed for EOI) and the interrupt ID.
+fn acknowledge() -> (u64, u64) {
+    match GICC_BASE.load(Ordering::Relaxed) {
+        gicc @ 1.. => {
+            // SAFETY: GICC_IAR of the GICv2 CPU interface set up in `init`.
+            let iar = unsafe { read32(gicc + GICC_IAR) } as u64;
+            (iar, iar & GICC_IAR_ID_MASK)
+        }
+        0 => {
+            let iar = read_sysreg!("S3_0_C12_C12_0"); // ICC_IAR1_EL1
+            (iar, iar)
+        }
+    }
+}
+
+/// Signal the end of the interrupt acknowledged as `iar`.
+fn end_of_interrupt(iar: u64) {
+    match GICC_BASE.load(Ordering::Relaxed) {
+        // SAFETY: GICC_EOIR of the GICv2 CPU interface, value from GICC_IAR.
+        gicc @ 1.. => unsafe { write32(gicc + GICC_EOIR, iar as u32) },
+        // SAFETY: ICC_EOIR1_EL1 with the value from ICC_IAR1_EL1.
+        0 => unsafe { write_sysreg!("S3_0_C12_C12_1", iar) },
+    }
+}
+
 /// IRQ handler, called from the exception vector with IRQs masked.
 pub fn handle_irq() {
-    let intid = read_sysreg!("S3_0_C12_C12_0"); // ICC_IAR1_EL1: acknowledge
+    let (iar, intid) = acknowledge();
     if intid >= SPURIOUS_INTID {
         return; // spurious: nothing pending any more
     }
@@ -131,8 +247,7 @@ pub fn handle_irq() {
         // SAFETY: re-arming our own timer.
         unsafe { write_sysreg!("CNTV_CVAL_EL0", next.max(counter())) };
     }
-    // SAFETY: signals end of interrupt for the ID we just acknowledged.
-    unsafe { write_sysreg!("S3_0_C12_C12_1", intid) }; // ICC_EOIR1_EL1
+    end_of_interrupt(iar);
 }
 
 /// Number of timer interrupts handled since boot.

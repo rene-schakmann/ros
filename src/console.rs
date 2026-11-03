@@ -108,15 +108,20 @@ impl Console {
     }
 
     /// Copy a rectangle from the shadow buffer to video memory.
+    ///
+    /// Each row is then written back from the CPU cache: on the Raspberry Pi 5
+    /// the display engine reads the framebuffer straight from RAM.
     fn flush(&self, x: usize, y: usize, w: usize, h: usize) {
         let fb = self.fb.base as *mut u32;
         for row in y..y + h {
             let src = &self.shadow[row * self.fb.width + x..][..w];
+            let start = row * self.fb.stride + x;
             for (i, &px) in src.iter().enumerate() {
                 // SAFETY: `row < height` and `x + i < width <= stride`, so the
                 // pixel lies inside the framebuffer promised to `Console::new`.
-                unsafe { fb.add(row * self.fb.stride + x + i).write_volatile(px) };
+                unsafe { fb.add(start + i).write_volatile(px) };
             }
+            crate::arch::dma_clean(self.fb.base + start as u64 * 4, w * 4);
         }
     }
 

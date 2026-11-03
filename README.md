@@ -6,8 +6,8 @@
 ![Platform: AArch64 UEFI](https://img.shields.io/badge/platform-AArch64%20UEFI-lightgrey.svg)
 
 A tiny AArch64 operating system written in `no_std` Rust. It boots via UEFI in
-QEMU or VirtualBox, greets you with a "HELLO RENE" banner and drops into a small
-shell. About 3,000 lines of heavily commented code, small enough to read in a
+QEMU, VirtualBox or on a [Raspberry Pi 5](#raspberry-pi-5), greets you with a
+"HELLO RENE" banner and drops into a small shell. About 3,500 lines of heavily commented code, small enough to read in a
 weekend.
 
 ![ROS booting to its shell](docs/screenshots/boot.png)
@@ -20,13 +20,13 @@ drives the hardware itself, with its own drivers:
 |--------------------|---------------------------------------------------------|
 | Screen             | framebuffer + bitmap font (`noto-sans-mono-bitmap`)     |
 | Keyboard           | xHCI USB host controller driver + HID boot keyboard     |
-| Interrupts         | exception vector table, GICv3 interrupt controller      |
+| Interrupts         | exception vectors (EL1 or EL2), GICv2 or GICv3          |
 | Timer              | ARM generic timer, 100 Hz tick                          |
-| Hardware discovery | ACPI tables (MADT, MCFG, GTDT, FADT, DSDT)              |
+| Hardware discovery | ACPI tables (MADT, MCFG, GTDT, FADT, SPCR, DSDT)        |
 | Devices            | PCI Express enumeration via ECAM                        |
 | Memory             | 32 MiB heap + page allocator from the UEFI memory map   |
 | Debug log          | PL011 UART (mirrors everything shown on screen)         |
-| Power off / reboot | PSCI calls to the hypervisor                            |
+| Power off / reboot | PSCI calls to the hypervisor or secure firmware         |
 | Clock              | UEFI runtime services (they survive `ExitBootServices`) |
 
 The MMU stays on with the firmware's identity mapping (virtual = physical).
@@ -81,17 +81,102 @@ qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 1024 \
   -device qemu-xhci -device usb-kbd -device ramfb -nic none -serial stdio
 ```
 
+## Raspberry Pi 5
+
+ROS runs on a Raspberry Pi 5 on top of the community UEFI firmware
+[worproject/rpi5-uefi](https://github.com/worproject/rpi5-uefi) (TF-A + EDK2).
+That firmware provides the UEFI boot services and ACPI tables ROS expects. On
+the Pi, ROS:
+
+- runs at EL2, where the firmware hands over (VMs use EL1),
+- drives the GIC-400 (GICv2) interrupt controller,
+- finds the two USB controllers inside the RP1 I/O chip through ACPI (they are
+  not PCI devices) and does the cache maintenance their non-coherent DMA needs,
+- skips the PCI scan: the Broadcom PCIe controllers are not ECAM compliant.
+
+> **Status: experimental.** The Pi 5 code paths are built and tested in CI in
+> QEMU with a GICv2 at EL2 (`PROFILE=gicv2-el2 make smoke`). Reports from real
+> hardware are very welcome, as an issue with the serial log.
+
+### What you need
+
+- Raspberry Pi 5 and a microSD card (any size; ROS uses 64 MB)
+- HDMI display (micro-HDMI port **0**, next to the USB-C power port) and a USB
+  keyboard
+- Optional but recommended: a 3.3 V USB-serial adapter on the 3-pin **UART**
+  connector between the HDMI ports (115200 8N1). Everything ROS shows on screen
+  is mirrored there, and you can type commands over it too.
+
+### Build the SD card image
+
+```sh
+make rpi5
+```
+
+This compiles ROS, downloads the rpi5-uefi v0.3 firmware (checked against a
+pinned SHA-256) and creates:
+
+- `build/ros-rpi5.img`: a ready-to-flash 64 MB disk image (MBR, one FAT32 partition)
+- `build/rpi5/`: the same files, to copy onto any FAT32-formatted SD card:
+
+  ```text
+  RPI_EFI.fd               UEFI firmware (TF-A + EDK2)
+  config.txt               tells the Pi bootloader to load RPI_EFI.fd
+  bcm2712-rpi-5-b.dtb      device tree (used by the firmware)
+  EFI/BOOT/BOOTAA64.EFI    ROS
+  startup.nsh              fallback for the UEFI shell
+  ```
+
+### Write it to the SD card
+
+With [Raspberry Pi Imager](https://www.raspberrypi.com/software/): *Choose OS →
+Use custom* → select `build/ros-rpi5.img` → *Write*.
+
+Or on the command line. **Double-check the device name: `dd` overwrites it
+completely.**
+
+```sh
+# macOS: find the card with `diskutil list`, e.g. /dev/disk4
+diskutil unmountDisk /dev/disk4
+sudo dd if=build/ros-rpi5.img of=/dev/rdisk4 bs=4m && sync
+
+# Linux: find the card with `lsblk`, e.g. /dev/sdX
+sudo dd if=build/ros-rpi5.img of=/dev/sdX bs=4M conv=fsync status=progress
+```
+
+Alternatively, format the card as FAT32 (MBR) and copy the contents of
+`build/rpi5/` onto it.
+
+### Boot
+
+Insert the card and power on. You see the Raspberry Pi logo while the UEFI
+firmware loads, then it starts `\EFI\BOOT\BOOTAA64.EFI`: ROS boots to the shell.
+Press <kbd>Esc</kbd> at the logo to enter the firmware setup instead.
+
+### Known limitations
+
+- **Firmware support ended.** rpi5-uefi is archived. It was tested on early
+  Pi 5 boards (BCM2712 C1 stepping); on newer boards (D0 stepping, e.g. the
+  2 GB model) or with a recent bootloader EEPROM, the firmware's HDMI output
+  is reported to stay black. ROS then still works over the serial console.
+  If you have that problem, try an older EEPROM version (see the rpi5-uefi
+  README).
+- Only the boot CPU is used, and only USB keyboards (no Ethernet, Wi-Fi, SD
+  card or GPIO drivers).
+- USB keyboards must support the HID boot protocol (practically all do).
+
 ## All `make` targets
 
 | Command            | What it does                                                   |
 |--------------------|----------------------------------------------------------------|
 | `make image`       | build `build/ros.img` (GPT disk, FAT32 ESP, `\EFI\BOOT\BOOTAA64.EFI`) |
+| `make rpi5`        | build `build/ros-rpi5.img`, the [Raspberry Pi 5](#raspberry-pi-5) SD card image |
 | `make qemu`        | boot in QEMU with the serial console in your terminal          |
 | `make run`         | boot in VirtualBox                                             |
 | `make log`         | follow the VirtualBox VM's serial log                          |
 | `make test`        | unit tests                                                     |
 | `make check`       | `rustfmt`, `clippy` (kernel and tests) and `rustdoc`           |
-| `make smoke`       | boot in QEMU and test the shell end to end                     |
+| `make smoke`       | boot in QEMU and test the shell end to end (`PROFILE=gicv2-el2 make smoke` mimics the Pi 5: GICv2, EL2) |
 | `make screenshots` | regenerate `docs/screenshots/*.png`                            |
 | `make clean`       | remove build output and delete the VirtualBox VM               |
 
@@ -140,9 +225,9 @@ more depth.
 | File                | Purpose                                                |
 |---------------------|--------------------------------------------------------|
 | `src/main.rs`       | UEFI boot stage, `ExitBootServices`, kernel init       |
-| `src/arch.rs`       | CPU registers, barriers, IRQ masking, PSCI power       |
-| `src/exceptions.rs` | exception vector table (assembly), panic screen        |
-| `src/interrupts.rs` | GICv3 + generic timer, uptime, delays                  |
+| `src/arch.rs`       | CPU registers, barriers, cache maintenance, PSCI power |
+| `src/exceptions.rs` | exception vector tables for EL1/EL2, panic screen      |
+| `src/interrupts.rs` | GICv2/GICv3 + generic timer, uptime, delays            |
 | `src/acpi.rs`       | finds hardware addresses in the ACPI tables            |
 | `src/memory.rs`     | heap and physical page allocator                       |
 | `src/mmio.rs`       | device register access                                 |
@@ -164,6 +249,8 @@ more depth.
   system calls.
 - Read files: a virtio-blk/virtio-scsi driver and a FAT32 reader for the boot disk.
 - Multiple CPUs: wake the other cores with PSCI `CPU_ON`.
+- Raspberry Pi 5 without UEFI: boot directly from the Pi firmware with a
+  device tree instead of ACPI.
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -178,8 +265,12 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
   may choose load forms with address write-back.
 - **"Failed to load the NVRAM store"** after a crash: delete
   `~/VirtualBox VMs/ROS/ROS.nvram` and start again.
-- **Nothing happens / black screen**: check `build/serial.log` (VirtualBox) or
-  the terminal output (QEMU). Everything on screen is also logged there.
+- **Nothing happens / black screen**: check `build/serial.log` (VirtualBox), the
+  terminal output (QEMU) or the serial console (Raspberry Pi 5). Everything on
+  screen is also logged there.
+- **Raspberry Pi 5 shows only a rainbow or the bootloader screen**: the card is
+  missing `config.txt`/`RPI_EFI.fd`, or the partition isn't FAT32 on an MBR
+  partition table. Rebuild with `make rpi5`.
 - **`make test` fails with assembler errors**: the tests need an AArch64 host;
   see [All `make` targets](#all-make-targets).
 

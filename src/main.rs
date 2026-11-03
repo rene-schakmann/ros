@@ -174,6 +174,11 @@ extern "C" fn kernel_main() -> ! {
     let boot = BOOT_INFO.get().expect("boot info missing");
 
     exceptions::init();
+    // The screen first, so that even an ACPI error below is visible.
+    if let Some(fb) = boot.framebuffer {
+        // SAFETY: the framebuffer from GOP stays valid after ExitBootServices.
+        unsafe { console::init(fb) };
+    }
     // SAFETY: `rsdp` came from the firmware's configuration table, and the
     // ACPI tables stay mapped (identity mapping, reserved memory).
     let platform = match unsafe { acpi::parse(boot.rsdp) } {
@@ -186,12 +191,8 @@ extern "C" fn kernel_main() -> ! {
     }
     log!("\nROS kernel started, firmware exited");
 
-    if let Some(fb) = boot.framebuffer {
-        // SAFETY: the framebuffer from GOP stays valid after ExitBootServices.
-        unsafe { console::init(fb) };
-    }
     memory::init_frames(boot.memory_map.clone());
-    cprint!(color::WHITE, "ROS kernel booting\n\n");
+    cprint!(color::WHITE, "ROS kernel booting on a {}\n\n", platform.board.name());
     ok(format_args!("left UEFI boot services, running at EL{} on our own stack", arch::current_el()));
     match &boot.framebuffer {
         Some(fb) => ok(format_args!("framebuffer {}x{} at {:#x}", fb.width, fb.height, fb.base)),
@@ -201,41 +202,65 @@ extern "C" fn kernel_main() -> ! {
     let free = memory::stats().free;
     ok(format_args!("memory: {} MiB free, {} MiB heap", free >> 20, HEAP_SIZE >> 20));
 
+    let gic = platform.gic().unwrap_or_else(|err| panic!("ACPI: {err}"));
     // SAFETY: GIC addresses from ACPI, vectors installed, single call on the boot CPU.
-    unsafe { interrupts::init(platform.gicd, platform.gicr, platform.timer_irq) };
+    unsafe { interrupts::init(gic, platform.timer_irq) };
     arch::enable_irqs();
-    ok(format_args!("GICv3 interrupt controller, timer at {} Hz", interrupts::TICK_HZ));
+    let version = if matches!(gic, interrupts::Gic::V2 { .. }) { 2 } else { 3 };
+    ok(format_args!("GICv{version} interrupt controller, timer at {} Hz", interrupts::TICK_HZ));
 
-    // SAFETY: the ECAM window and bus range come from the ACPI MCFG table.
-    let devices = unsafe { pci::scan(platform.pci_ecam, platform.pci_bus_start, platform.pci_bus_end) };
-    ok(format_args!("PCI: {} devices", devices.len()));
+    let devices = if platform.board == acpi::Board::RaspberryPi5 {
+        // The Broadcom PCIe controllers only expose one device through a
+        // config window; probing other slots can hang the bus. The only
+        // device we need, the RP1 USB, is found through ACPI instead.
+        ok(format_args!("PCI: skipped (not ECAM compliant on this board)"));
+        Vec::new()
+    } else {
+        // SAFETY: the ECAM window and bus range come from the ACPI MCFG table.
+        let devices = unsafe { pci::scan(platform.pci_ecam, platform.pci_bus_start, platform.pci_bus_end) };
+        ok(format_args!("PCI: {} devices", devices.len()));
+        devices
+    };
 
-    init_usb(&devices);
+    init_usb(&devices, &platform);
 
     shell::Shell::new(platform, devices).run()
 }
 
-/// Find the xHCI controller, start it and look for a keyboard.
-fn init_usb(devices: &[pci::Device]) {
-    let Some(controller) = devices.iter().find(|d| d.is(pci::CLASS_XHCI)) else {
+/// Start every xHCI controller (PCI functions and, on the Raspberry Pi 5,
+/// the RP1's built-in ones) and look for a keyboard.
+fn init_usb(devices: &[pci::Device], platform: &acpi::Platform) {
+    let pci = devices.iter().filter(|d| d.is(pci::CLASS_XHCI)).map(|d| {
+        d.enable();
+        d.bar(0)
+    });
+    let bases: Vec<u64> = pci.chain(platform.platform_xhci()).collect();
+    if bases.is_empty() {
         return fail(format_args!("no USB xHCI controller"));
-    };
-    controller.enable();
-    // SAFETY: BAR 0 of an xHCI controller with memory access and DMA enabled,
-    // and no other driver touches it.
-    match unsafe { xhci::Xhci::new(controller.bar(0)) } {
-        Ok(mut usb) => {
-            usb.enumerate();
-            let (count, keyboard) = (usb.devices.len(), usb.has_keyboard());
-            *keyboard::USB.lock() = Some(usb);
-            ok(format_args!("USB: {count} devices"));
-            if keyboard {
-                ok(format_args!("USB keyboard ready"));
-            } else {
-                fail(format_args!("no USB keyboard (serial input still works)"));
+    }
+
+    let mut controllers = Vec::new();
+    for base in bases {
+        // SAFETY: `base` is BAR 0 of an enabled xHCI PCI function, or an xHCI
+        // controller the firmware described in ACPI; no other driver touches it.
+        match unsafe { xhci::Xhci::new(base) } {
+            Ok(mut usb) => {
+                usb.enumerate();
+                controllers.push(usb);
             }
+            Err(e) => fail(format_args!("USB controller at {base:#x}: {e}")),
         }
-        Err(e) => fail(format_args!("USB: {e}")),
+    }
+    let count: usize = controllers.iter().map(|c| c.devices.len()).sum();
+    let keyboard = controllers.iter().any(xhci::Xhci::has_keyboard);
+    if !controllers.is_empty() {
+        ok(format_args!("USB: {count} devices on {} controller(s)", controllers.len()));
+    }
+    *keyboard::USB.lock() = controllers;
+    if keyboard {
+        ok(format_args!("USB keyboard ready"));
+    } else {
+        fail(format_args!("no USB keyboard (serial input still works)"));
     }
 }
 

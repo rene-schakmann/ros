@@ -4,7 +4,7 @@ FROM rust:1.99.1-slim-trixie
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        make mtools dosfstools fdisk file \
+        make mtools dosfstools fdisk file curl ca-certificates unzip \
         qemu-system-arm qemu-efi-aarch64 python3 \
  && rm -rf /var/lib/apt/lists/*
 

@@ -1,7 +1,7 @@
 //! Exception handling: what the CPU does when something interrupts normal flow.
 //!
 //! On AArch64 the CPU jumps to a table of 16 entry points (the "vector table",
-//! address in VBAR_EL1) whenever an exception happens:
+//! address in `VBAR_ELx`) whenever an exception happens:
 //! - synchronous: caused by the current instruction (bad memory access,
 //!   breakpoint, system call)
 //! - IRQ: a device (e.g. the timer) raised an interrupt
@@ -9,6 +9,12 @@
 //!
 //! Each entry saves all registers into a [`Frame`] on the stack, calls
 //! `handle_exception` in Rust, restores the registers and returns with `eret`.
+//!
+//! ROS runs at whatever exception level the firmware handed over: EL1 in
+//! QEMU and VirtualBox, EL2 (hypervisor mode) on the Raspberry Pi 5. The two
+//! levels have their own copies of the exception registers (`ELR_EL1` vs.
+//! `ELR_EL2`, ...), so the assembly below is a macro that builds one vector
+//! table per level, and [`init`] installs the matching one.
 //!
 //! Reference: Arm Architecture Reference Manual (DDI 0487), chapter D1
 //! ("The AArch64 System Level Programmers' Model").
@@ -50,47 +56,52 @@ const _: () = {
 const KIND_SYNC: u64 = 0;
 const KIND_IRQ: u64 = 1;
 
-/// ESR_EL1 exception class of a `brk` instruction.
+/// ESR exception class of a `brk` instruction.
 const EC_BRK: u64 = 0x3c;
 
 global_asm!(
     r#"
-.macro SAVE_AND_CALL kind
+// One vector table entry: make room for a Frame, save x0/x1, pass the entry
+// index in x0 and continue in the shared code for exception level `el`.
+.macro SAVE_AND_CALL kind, el
     .balign 0x80
     sub sp, sp, #800        // FRAME_SIZE
     stp x0, x1, [sp, #0]
     mov x0, #\kind
-    b exception_common
+    b exception_common_el\el
 .endm
 
-.section .text.vectors, "ax"
+// A complete vector table plus its shared save/call/restore code for one
+// exception level (1 or 2).
+.macro VECTORS el
+.section .text.vectors_el\el, "ax"
 .balign 2048
-.global exception_vectors
-exception_vectors:
+.global exception_vectors_el\el
+exception_vectors_el\el:
     // Current EL, using SP_EL0
-    SAVE_AND_CALL 0
-    SAVE_AND_CALL 1
-    SAVE_AND_CALL 2
-    SAVE_AND_CALL 3
-    // Current EL, using SP_ELx (this is us: kernel running at EL1)
-    SAVE_AND_CALL 4
-    SAVE_AND_CALL 5
-    SAVE_AND_CALL 6
-    SAVE_AND_CALL 7
+    SAVE_AND_CALL 0, \el
+    SAVE_AND_CALL 1, \el
+    SAVE_AND_CALL 2, \el
+    SAVE_AND_CALL 3, \el
+    // Current EL, using SP_ELx (this is us: the kernel)
+    SAVE_AND_CALL 4, \el
+    SAVE_AND_CALL 5, \el
+    SAVE_AND_CALL 6, \el
+    SAVE_AND_CALL 7, \el
     // Lower EL, AArch64 (user programs, if we had any)
-    SAVE_AND_CALL 8
-    SAVE_AND_CALL 9
-    SAVE_AND_CALL 10
-    SAVE_AND_CALL 11
+    SAVE_AND_CALL 8, \el
+    SAVE_AND_CALL 9, \el
+    SAVE_AND_CALL 10, \el
+    SAVE_AND_CALL 11, \el
     // Lower EL, AArch32
-    SAVE_AND_CALL 12
-    SAVE_AND_CALL 13
-    SAVE_AND_CALL 14
-    SAVE_AND_CALL 15
+    SAVE_AND_CALL 12, \el
+    SAVE_AND_CALL 13, \el
+    SAVE_AND_CALL 14, \el
+    SAVE_AND_CALL 15, \el
 
 // Shared tail of all entries: x0 = kind, x1 = frame. Save the remaining
 // registers, call into Rust, restore everything and return.
-exception_common:
+exception_common_el\el:
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
     stp x6, x7, [sp, #48]
@@ -106,8 +117,8 @@ exception_common:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
-    mrs x2, elr_el1
-    mrs x3, spsr_el1
+    mrs x2, elr_el\el
+    mrs x3, spsr_el\el
     stp x2, x3, [sp, #248]  // elr, spsr
     add x2, sp, #272        // q registers
     stp q0, q1, [x2, #0]
@@ -156,8 +167,8 @@ exception_common:
     ldp q28, q29, [x2, #448]
     ldp q30, q31, [x2, #480]
     ldp x2, x3, [sp, #248]
-    msr elr_el1, x2
-    msr spsr_el1, x3
+    msr elr_el\el, x2
+    msr spsr_el\el, x3
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
@@ -176,24 +187,46 @@ exception_common:
     ldr x30, [sp, #240]
     add sp, sp, #800
     eret
+.endm
+
+VECTORS 1
+VECTORS 2
 "#
 );
 
 unsafe extern "C" {
-    /// Start of the vector table defined in the assembly above.
-    static exception_vectors: u8;
+    /// Vector table for running at EL1 (defined in the assembly above).
+    static exception_vectors_el1: u8;
+    /// Vector table for running at EL2 (defined in the assembly above).
+    static exception_vectors_el2: u8;
 }
 
-/// Point the CPU at our vector table.
+/// Point the CPU at the vector table for the current exception level.
 pub fn init() {
-    let table = &raw const exception_vectors as u64;
-    // SAFETY: `exception_vectors` is a complete, 2 KiB aligned vector table
-    // whose entries all lead to `handle_exception`.
-    unsafe { write_sysreg!("VBAR_EL1", table) };
+    // SAFETY: both tables are complete, 2 KiB aligned vector tables whose
+    // entries all lead to `handle_exception`; each is installed only at the
+    // exception level whose registers it uses.
+    unsafe {
+        if arch::current_el() == 2 {
+            write_sysreg!("VBAR_EL2", &raw const exception_vectors_el2 as u64);
+        } else {
+            write_sysreg!("VBAR_EL1", &raw const exception_vectors_el1 as u64);
+        }
+    }
     arch::isb();
 }
 
-/// Exception classes (ESR_EL1 bits 31:26) worth naming.
+/// Exception syndrome register of the current exception level.
+fn esr() -> u64 {
+    if arch::current_el() == 2 { read_sysreg!("ESR_EL2") } else { read_sysreg!("ESR_EL1") }
+}
+
+/// Fault address register of the current exception level.
+fn far() -> u64 {
+    if arch::current_el() == 2 { read_sysreg!("FAR_EL2") } else { read_sysreg!("FAR_EL1") }
+}
+
+/// Exception classes (ESR bits 31:26) worth naming.
 fn class_name(ec: u64) -> &'static str {
     match ec {
         0x00 => "unknown instruction",
@@ -202,6 +235,7 @@ fn class_name(ec: u64) -> &'static str {
         0x22 => "misaligned program counter",
         0x24 | 0x25 => "data abort (bad memory access)",
         0x26 => "misaligned stack pointer",
+        0x2f => "SError (asynchronous external abort)",
         EC_BRK => "breakpoint (brk)",
         _ => "other",
     }
@@ -213,9 +247,8 @@ extern "C" fn handle_exception(kind: u64, frame: &mut Frame) {
     match kind % 4 {
         KIND_IRQ => crate::interrupts::handle_irq(),
         KIND_SYNC => {
-            let esr = read_sysreg!("ESR_EL1");
-            let ec = esr >> 26;
-            if ec == EC_BRK {
+            let esr = esr();
+            if esr >> 26 == EC_BRK {
                 // Breakpoint: report it and continue after the `brk` instruction.
                 cprint!(color::YELLOW, "breakpoint hit at {:#x}, resuming\n", frame.elr);
                 frame.elr += 4;
@@ -223,7 +256,7 @@ extern "C" fn handle_exception(kind: u64, frame: &mut Frame) {
             }
             fatal(frame, esr, "CPU exception");
         }
-        _ => fatal(frame, read_sysreg!("ESR_EL1"), "unexpected FIQ/SError"),
+        _ => fatal(frame, esr(), "unexpected FIQ/SError"),
     }
 }
 
@@ -235,7 +268,7 @@ fn fatal(frame: &Frame, esr: u64, what: &str) -> ! {
     let ec = esr >> 26;
     cprint!(color::LIGHT_RED, "\n*** KERNEL PANIC: {what} ***\n");
     cprint!(color::LIGHT_RED, "{} (ESR={esr:#x})\n", class_name(ec));
-    cprint!(color::WHITE, "at pc={:#x}  fault address={:#x}\n", frame.elr, read_sysreg!("FAR_EL1"));
+    cprint!(color::WHITE, "at pc={:#x}  fault address={:#x}\n", frame.elr, far());
     for i in (0..30).step_by(3) {
         cprint!(
             color::GRAY,
@@ -248,6 +281,6 @@ fn fatal(frame: &Frame, esr: u64, what: &str) -> ! {
             frame.x[i + 2]
         );
     }
-    cprint!(color::YELLOW, "\nSystem halted. Close the VM window or run `make run` again.\n");
+    cprint!(color::YELLOW, "\nSystem halted. Power-cycle the machine or restart the VM.\n");
     arch::halt()
 }

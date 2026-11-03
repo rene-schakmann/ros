@@ -39,8 +39,10 @@ describes it, and `make check` builds the API docs
    - shell                     ▼  src/shell.rs (never returns)
 ```
 
-The kernel runs at EL1 (kernel mode). It keeps the firmware's page tables,
-which map all memory 1:1, so a physical address can be used as a pointer.
+The kernel runs at the exception level the firmware hands over: EL1 (kernel
+mode) in QEMU and VirtualBox, EL2 (hypervisor mode) on the Raspberry Pi 5. It
+keeps the firmware's page tables, which map all memory 1:1, so a physical
+address can be used as a pointer.
 
 ## Memory
 
@@ -54,7 +56,10 @@ which map all memory 1:1, so a physical address can be used as a pointer.
 
 ## Exceptions and interrupts
 
-`exceptions.rs` defines the 16-entry vector table in assembly. Each entry saves
+`exceptions.rs` defines the 16-entry vector table in assembly, once per
+exception level (EL1 and EL2 have separate `ELR`/`SPSR`/`ESR`/`FAR`
+registers); `exceptions::init` installs the one matching the current level.
+Each entry saves
 all general purpose and SIMD registers into a `Frame` (layout checked at compile
 time) and calls `handle_exception` in Rust:
 
@@ -63,8 +68,12 @@ time) and calls `handle_exception` in Rust:
 - **Breakpoint** (`brk`) → print a message, skip the instruction, resume.
 - **Anything else** → panic screen with the registers, then halt.
 
-The GICv3 is set up with affinity routing; only the virtual timer interrupt
-(PPI 27, or whatever the ACPI GTDT says) is enabled. The timer fires at 100 Hz.
+The MADT says which GIC generation the machine has. A GICv3 (QEMU, VirtualBox)
+is set up with affinity routing and the `ICC_*` system register CPU interface;
+a GICv2 (the Pi 5's GIC-400) through its memory-mapped CPU interface. Only the
+virtual timer interrupt (PPI 27, or whatever the ACPI GTDT says) is enabled.
+At EL2, `HCR_EL2.IMO/FMO/AMO` route interrupts to EL2 so they aren't stuck
+waiting for an EL1 that doesn't exist. The timer fires at 100 Hz.
 Each tick wakes the CPU from `wfi`, so the shell can poll the keyboard without
 spinning.
 
@@ -80,10 +89,30 @@ of hardcoding them:
 | MCFG  | PCIe ECAM base and bus range                             |
 | GTDT  | virtual timer interrupt number                           |
 | FADT  | whether PSCI uses `hvc` or `smc`; the DSDT address       |
-| DSDT  | PL011 UART base (found by its hardware ID `ARMH0011`)    |
+| SPCR  | PL011 UART base (the firmware's serial console)          |
+| DSDT  | board identity; UART fallback (hardware ID `ARMH0011`); on the Pi 5 the RP1 BAR (`PBAR`) |
 
 Each table is turned into a bounds-checked byte slice before it is parsed, and
 the parsers are unit-tested with synthetic tables.
+
+## Raspberry Pi 5
+
+The Pi 5 differs from the virtual machines in four ways, each handled in one place:
+
+| Difference | Where it's handled |
+|------------|--------------------|
+| Firmware hands over at EL2 | `exceptions.rs` (EL2 vectors), `interrupts.rs` (IRQ routing), `arch::psci_call` (`smc`, since `hvc` would trap into ROS itself) |
+| GIC-400 is a GICv2 | `interrupts::init_gicv2` |
+| USB controllers live in the RP1 I/O chip, which sits behind PCIe but whose peripherals are not PCI functions | `acpi::parse_dsdt` finds the RP1 BAR the firmware mapped (`PBAR`), the xHCI controllers are at `+0x200000` and `+0x300000` |
+| RP1 DMA is not cache coherent, and only reaches the first 3 GiB | `arch::dma_clean`/`dma_invalidate` around every xHCI structure; `memory::DMA_LIMIT` |
+
+The Broadcom PCIe controllers are not ECAM compliant (one config window per
+controller), so on the Pi the PCI scan is skipped. The framebuffer is written
+back from the CPU cache after every update so the display engine sees it.
+
+QEMU can't emulate a Pi 5, but `PROFILE=gicv2-el2 make smoke` boots ROS on a
+QEMU machine with a GICv2 and the firmware at EL2, which covers the first two
+rows in CI.
 
 ## Device register access
 
@@ -97,11 +126,13 @@ callers document why the address is a register they own.
 ## USB keyboard (xHCI)
 
 `xhci.rs` implements the minimum of the xHCI specification needed for a
-keyboard:
+keyboard. ROS starts every controller it finds (PCI functions plus the Pi 5's
+RP1 controllers) and polls them all:
 
 1. Halt and reset the controller, set up the device context array, a command
    ring and an event ring.
-2. For each connected port: reset it, enable a slot, *Address Device*, read the
+2. Power all ports (needed after a reset when the controller has port power
+   control). For each connected port: reset it, enable a slot, *Address Device*, read the
    device/configuration descriptors and the product name, *Set Configuration*.
 3. If an interface is a HID boot keyboard, switch it to the boot protocol and
    configure its interrupt IN endpoint.
