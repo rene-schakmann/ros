@@ -1,0 +1,7 @@
+# Pin the toolchain so every contributor, the Docker image and CI build with
+# exactly the same compiler. Bump together with the `FROM` line in Dockerfile.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-unknown-uefi"]
+profile = "minimal"

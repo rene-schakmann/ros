@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, lint, docs
+    # ARM runner: the unit-test lints compile the kernel modules for the host.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      - run: make -f build.mk check
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      - run: make -f build.mk test
+
+  smoke:
+    name: Boot test (QEMU)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install image tools and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mtools dosfstools fdisk qemu-system-arm qemu-efi-aarch64
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      - name: Build disk image
+        run: make -f build.mk
+      - name: Boot and test the shell
+        run: make -f build.mk smoke
+        env:
+          TIMEOUT: "300"
+      - name: Upload disk image
+        uses: actions/upload-artifact@v7
+        with:
+          name: ros-image
+          path: |
+            build/ros.img
+            target/aarch64-unknown-uefi/release/ros.efi
+          retention-days: 14
+
+  docker:
+    name: Docker build environment
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t ros-build .
+      - run: docker run --rm -v "$PWD":/ros ros-build make -f build.mk

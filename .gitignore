@@ -1,0 +1,11 @@
+# Build output
+/build/
+/target/
+
+# Editors and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+*.swp
+__pycache__/

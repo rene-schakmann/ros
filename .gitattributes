@@ -1,0 +1,4 @@
+* text=auto eol=lf
+# The UEFI shell expects DOS line endings.
+startup.nsh text eol=crlf
+*.png binary

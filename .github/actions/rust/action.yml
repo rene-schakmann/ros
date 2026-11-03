@@ -1,0 +1,15 @@
+name: Set up Rust
+description: Install rustup if needed and the toolchain pinned in rust-toolchain.toml
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        if ! command -v rustup >/dev/null; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+        fi
+        # Reads rust-toolchain.toml: toolchain, components and targets.
+        rustup toolchain install
+        rustup show active-toolchain

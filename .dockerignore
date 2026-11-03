@@ -1,0 +1,3 @@
+# Only rust-toolchain.toml is copied into the image; keep the build context tiny.
+*
+!rust-toolchain.toml

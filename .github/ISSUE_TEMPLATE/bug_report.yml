@@ -1,0 +1,34 @@
+name: Bug report
+description: ROS crashes, hangs or does something unexpected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: vm
+    attributes:
+      label: Where did you run ROS?
+      options:
+        - QEMU (make qemu / make smoke)
+        - QEMU (native)
+        - VirtualBox
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: ROS commit or release, host OS, QEMU or VirtualBox version.
+      placeholder: "v0.3.0, macOS 26.1 on M3, VirtualBox 7.2.4"
+  - type: textarea
+    id: log
+    attributes:
+      label: Serial log
+      description: build/serial.log (VirtualBox) or the terminal output (QEMU). A screenshot of the panic screen helps too.
+      render: text

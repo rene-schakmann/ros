@@ -1,0 +1,53 @@
+[package]
+name = "ros"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.99"
+description = "A tiny AArch64 operating system in no_std Rust that boots via UEFI and drives its own hardware."
+authors = ["Rene Schakmann"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rene-schakmann/ros"
+readme = "README.md"
+keywords = ["os", "kernel", "aarch64", "uefi", "no-std"]
+categories = ["embedded", "no-std", "hardware-support"]
+publish = false
+
+[dependencies]
+# Only used during boot: load the kernel, grab the framebuffer and memory map,
+# then ExitBootServices. After that the kernel drives the hardware itself.
+# (The runtime services, e.g. the real-time clock, stay usable.)
+uefi = { version = "0.41", default-features = false }
+# Backs Rust's `alloc` crate (Vec, String, Box) with a fixed-size heap.
+linked_list_allocator = "0.10.6"
+# Spinlocks: the kernel has no threads, but interrupts and the panic path
+# still need safe shared access to global state.
+spin = { version = "0.12.3", default-features = false, features = ["spin_mutex", "once"] }
+# Pre-rendered bitmap font for the framebuffer console.
+noto-sans-mono-bitmap = { version = "0.4", default-features = false, features = [
+    "regular",
+    "bold",
+    "size_20",
+    "unicode-basic-latin",
+    "unicode-latin-1-supplement",
+    "unicode-specials",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+# Every `unsafe` block must explain why it is sound (`// SAFETY: ...`).
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+semicolon_if_nothing_returned = "warn"

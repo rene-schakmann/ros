@@ -1,0 +1,10 @@
+# `cargo build` / `cargo clippy` target the UEFI firmware by default, so editors
+# (rust-analyzer) check the code exactly as it is built.
+[build]
+target = "aarch64-unknown-uefi"
+
+[alias]
+# Unit tests run as a normal Linux program on an AArch64 host (Docker on Apple
+# Silicon, ARM Linux, or the CI runner): `cargo test-host`.
+test-host = "test --target aarch64-unknown-linux-gnu"
+clippy-host = "clippy --tests --target aarch64-unknown-linux-gnu"
