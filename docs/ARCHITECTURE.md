@@ -93,7 +93,9 @@ of hardcoding them:
 | DSDT  | board identity; UART fallback (hardware ID `ARMH0011`); on the Pi 5 the RP1 BAR (`PBAR`) |
 
 Each table is turned into a bounds-checked byte slice before it is parsed, and
-the parsers are unit-tested with synthetic tables.
+the parsers are unit-tested with synthetic tables. Checksums are verified (all
+bytes of a table add up to 0); like Linux, ROS warns about a wrong one at boot
+but still uses the table.
 
 ## Raspberry Pi 5
 
@@ -135,13 +137,25 @@ RP1 controllers) and polls them all:
    control). For each connected port: reset it, enable a slot, *Address Device*, read the
    device/configuration descriptors and the product name, *Set Configuration*.
 3. If an interface is a HID boot keyboard, switch it to the boot protocol and
-   configure its interrupt IN endpoint.
-4. Keep one 8-byte transfer queued on that endpoint. Each completion is a
-   keyboard report; `keyboard.rs` turns reports into key presses (with US/DE
-   layouts and key repeat).
+   configure its interrupt IN endpoint. The product name string is read last:
+   some devices stall that request, which halts endpoint 0.
+4. Keep one 8-byte transfer queued on each keyboard's endpoint (a controller
+   can have several). Each completion is a keyboard report; `keyboard.rs`
+   turns reports into key presses (with US/DE layouts, Ctrl and key repeat).
 
-Everything is polled. The serial port is an alternative input, which is how
-the end-to-end test could also drive the shell.
+Everything is polled. The serial port is a second keyboard: `keyboard.rs`
+decodes UTF-8 and the ANSI escape sequences a terminal sends for arrow keys,
+Home, End and Delete (a lone ESC is the Escape key if nothing follows within
+100 ms), so both inputs produce the same keys.
+
+## Shell
+
+`shell.rs` reads a line with a small line editor (`LineEditor`). It keeps the
+text and the cursor position, and every edit returns what to print: a
+backspace character moves the cursor one cell left without erasing, so
+inserting in the middle prints the new character and the rest of the line,
+then moves back. The framebuffer console and serial terminals both
+understand that, so they show the same line.
 
 ## Console
 
@@ -154,8 +168,8 @@ printed is mirrored to the serial port.
 
 | Layer        | How                                                               |
 |--------------|-------------------------------------------------------------------|
-| Unit tests   | `make test`: modules compiled for `aarch64-unknown-linux-gnu`; the boot code is left out with `cfg(test)`. Covers ACPI parsing, USB descriptor parsing, keyboard layouts and repeat, the console, the frame allocator and shell helpers. |
+| Unit tests   | `make test`: modules compiled for `aarch64-unknown-linux-gnu`; the boot code is left out with `cfg(test)`. Covers ACPI parsing and checksums, USB descriptor parsing, keyboard layouts, repeat and serial input decoding, the console, the frame allocator, the line editor and shell helpers. |
 | Lints        | `make check`: `rustfmt`, `clippy -D warnings` for both targets (every `unsafe` block needs a `// SAFETY:` comment), `rustdoc -D warnings`. |
-| End to end   | `make smoke`: `scripts/qemu.py` boots the image in QEMU, waits for the prompt, types commands on the emulated USB keyboard through QMP, checks the serial output and expects `shutdown` to power the VM off. |
+| End to end   | `make smoke`: `scripts/qemu.py` boots the image in QEMU with two USB keyboards, waits for the prompt, types commands on the emulated USB keyboard through QMP and on the serial port (line editing with escape sequences, UTF-8, Ctrl-C), checks the serial output and expects `shutdown` to power the VM off. |
 
 CI runs all three on every push and pull request.

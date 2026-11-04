@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Line editing: left/right, home/end and delete move through and edit the
+  whole line, not just its end. Ctrl-A/Ctrl-E work as home/end.
+- Ctrl-C cancels the line being typed and stops `sleep`; Ctrl-L clears the
+  screen.
+- Tab with several matching commands fills in their shared prefix, and
+  lists them when there is nothing left to fill in.
+- `history` command. The history keeps the last 100 commands.
+- Serial console: arrow keys and the other special keys work (ROS decodes the
+  terminal's escape sequences), non-ASCII characters are decoded from UTF-8,
+  output is colored with ANSI codes, and `clear` clears the terminal.
+- USB keyboards: Ctrl, the keypad, Home, End and Delete.
+- ACPI table checksums are checked; a wrong one is reported at boot.
+- The panic screen shows `x30` (the return address) and the stack pointer.
+- The smoke test drives the line editor over the serial port and checks that
+  every keyboard on a controller works.
+
+### Fixed
+
+- Several USB keyboards on one controller: only the last one found worked.
+- Keyboards that reject the request for their product name could end up not
+  working: the name is now read after the keyboard is set up.
+- Backspace and history recall at the start of a screen row didn't move
+  back to the previous row when a command line wrapped.
+- Arrow keys on the serial console inserted `[A`, `[B`, ... into the line.
+- 10 Gbit/s USB ports were shown as 5 Gbit/s.
+
 ## [0.4.0] - 2026-11-03
 
 ### Added

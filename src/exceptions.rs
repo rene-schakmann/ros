@@ -55,6 +55,8 @@ const _: () = {
 // Exception kinds: the vector table entry index modulo 4.
 const KIND_SYNC: u64 = 0;
 const KIND_IRQ: u64 = 1;
+/// Vector table entries 4-7: taken from the current EL while using SP_ELx.
+const FROM_SP_ELX: core::ops::Range<u64> = 4..8;
 
 /// ESR exception class of a `brk` instruction.
 const EC_BRK: u64 = 0x3c;
@@ -254,14 +256,14 @@ extern "C" fn handle_exception(kind: u64, frame: &mut Frame) {
                 frame.elr += 4;
                 return;
             }
-            fatal(frame, esr, "CPU exception");
+            fatal(kind, frame, esr, "CPU exception");
         }
-        _ => fatal(frame, esr(), "unexpected FIQ/SError"),
+        _ => fatal(kind, frame, esr(), "unexpected FIQ/SError"),
     }
 }
 
 /// Print the panic screen with the saved registers and stop.
-fn fatal(frame: &Frame, esr: u64, what: &str) -> ! {
+fn fatal(kind: u64, frame: &Frame, esr: u64, what: &str) -> ! {
     // SAFETY: the interrupted code might have held the console lock, but it
     // will never run again, so taking the lock over is fine.
     unsafe { console::CONSOLE.force_unlock() };
@@ -281,6 +283,14 @@ fn fatal(frame: &Frame, esr: u64, what: &str) -> ! {
             frame.x[i + 2]
         );
     }
+    // The interrupted code's stack pointer: the vector pushed the frame onto
+    // the same stack (SP_ELx), unless the exception came from code on SP_EL0.
+    let sp = if FROM_SP_ELX.contains(&kind) {
+        frame as *const Frame as u64 + FRAME_SIZE as u64
+    } else {
+        read_sysreg!("SP_EL0")
+    };
+    cprint!(color::GRAY, "x30={:016x}  sp ={sp:016x}  (x30 = return address)\n", frame.x[30]);
     cprint!(color::YELLOW, "\nSystem halted. Power-cycle the machine or restart the VM.\n");
     arch::halt()
 }

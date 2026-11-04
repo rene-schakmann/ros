@@ -162,6 +162,11 @@ fn fail(what: core::fmt::Arguments) {
     status(color::LIGHT_RED, "fail", what);
 }
 
+/// Print a yellow `[warn]` boot message.
+fn warn(what: core::fmt::Arguments) {
+    status(color::YELLOW, "warn", what);
+}
+
 fn status(rgb: u32, label: &str, what: core::fmt::Arguments) {
     cprint!(color::GRAY, "[");
     cprint!(rgb, "{label}");
@@ -199,6 +204,10 @@ extern "C" fn kernel_main() -> ! {
         None => fail(format_args!("no framebuffer (serial console only)")),
     }
     ok(format_args!("exception vectors installed"));
+    if let Some(signature) = platform.bad_checksum {
+        let name = core::str::from_utf8(&signature).unwrap_or("????");
+        warn(format_args!("ACPI table {name} has a wrong checksum (firmware bug?), using it anyway"));
+    }
     let free = memory::stats().free;
     ok(format_args!("memory: {} MiB free, {} MiB heap", free >> 20, HEAP_SIZE >> 20));
 

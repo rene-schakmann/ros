@@ -8,7 +8,8 @@
 The machine mirrors what ROS expects from VirtualBox: AArch64, UEFI firmware
 with ACPI, GICv3, a PL011 UART, an xHCI controller with a USB keyboard and a
 simple framebuffer (ramfb). Commands are typed on the emulated USB keyboard
-through QMP, so the test also covers the xHCI and HID code.
+through QMP, so the test also covers the xHCI and HID code, and on the serial
+port, which covers the line editor with the escape sequences a terminal sends.
 
 Only the Python standard library is used. Environment variables:
     QEMU        QEMU binary (default: qemu-system-aarch64)
@@ -20,6 +21,7 @@ Only the Python standard library is used. Environment variables:
                   gicv2-el2  GICv2, firmware hands over at EL2 (like the Raspberry Pi 5)
 """
 
+import codecs
 import json
 import os
 import re
@@ -61,6 +63,11 @@ KEYS.update({" ": ("spc", False), "-": ("minus", False), ".": ("dot", False),
              "/": ("slash", False), "\n": ("ret", False)})
 
 ANSI = re.compile(r"\x1b\[[0-9;=?]*[A-Za-z]")
+# An escape sequence cut off at the end of a chunk of serial output.
+ANSI_PARTIAL = re.compile(r"\x1b[^A-Za-z]*$")
+
+# What a terminal sends for special keys (xterm).
+UP, LEFT, RIGHT, HOME, DELETE, CTRL_C = "\x1b[A", "\x1b[D", "\x1b[C", "\x1b[H", "\x1b[3~", "\x03"
 
 
 def firmware() -> str:
@@ -70,7 +77,7 @@ def firmware() -> str:
     return path
 
 
-def qemu_command(extra: list[str]) -> list[str]:
+def qemu_command(extra: list[str], keyboards: int = 1) -> list[str]:
     if not IMAGE.exists():
         sys.exit(f"error: {IMAGE} not found; build it first (make image)")
     return [
@@ -82,7 +89,7 @@ def qemu_command(extra: list[str]) -> list[str]:
         "-drive", f"if=none,format=raw,file={IMAGE},id=disk,snapshot=on",
         "-device", "virtio-blk-pci,drive=disk",
         "-device", "qemu-xhci",
-        "-device", "usb-kbd",
+        *[arg for i in range(1, keyboards + 1) for arg in ("-device", f"usb-kbd,id=kbd{i}")],
         "-device", "ramfb",
         "-nic", "none",
         "-no-reboot",
@@ -93,13 +100,13 @@ def qemu_command(extra: list[str]) -> list[str]:
 class Machine:
     """A QEMU instance with the serial port on a pipe and a QMP control socket."""
 
-    def __init__(self) -> None:
+    def __init__(self, keyboards: int = 1) -> None:
         self.tmp = tempfile.mkdtemp(prefix="ros-qemu-")
         qmp_path = os.path.join(self.tmp, "qmp.sock")
         self.proc = subprocess.Popen(
             qemu_command(["-display", "none", "-serial", "stdio", "-monitor", "none",
-                          "-qmp", f"unix:{qmp_path},server=on,wait=off"]),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          "-qmp", f"unix:{qmp_path},server=on,wait=off"], keyboards),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         self.output = ""
         self.lock = threading.Lock()
@@ -117,8 +124,14 @@ class Machine:
         self.command("qmp_capabilities")
 
     def _read_serial(self) -> None:
+        # UTF-8 characters and escape sequences can be split across chunks.
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        carry = ""
         for chunk in iter(lambda: self.proc.stdout.read1(4096), b""):
-            text = ANSI.sub("", chunk.decode("utf-8", "replace")).replace("\r", "")
+            text = carry + decoder.decode(chunk)
+            partial = ANSI_PARTIAL.search(text)
+            carry = partial.group() if partial else ""
+            text = ANSI.sub("", text[: len(text) - len(carry)]).replace("\r", "")
             with self.lock:
                 self.output += text
             if os.environ.get("VERBOSE"):
@@ -165,6 +178,18 @@ class Machine:
         output = self.wait_for(PROMPT, start)
         return output[: -len(PROMPT)]
 
+    def send(self, text: str) -> None:
+        """Type `text` on the serial terminal."""
+        self.proc.stdin.write(text.encode())
+        self.proc.stdin.flush()
+
+    def run_serial(self, keys: str) -> list[str]:
+        """Type `keys` and Enter on the serial terminal; return the output lines."""
+        start = len(self.output)
+        self.send(keys + "\r")
+        output = self.wait_for(PROMPT, start)
+        return output[: -len(PROMPT)].splitlines()
+
     def screenshot(self, path: Path) -> None:
         time.sleep(0.6)  # let the cursor blink settle and the screen update
         self.command("screendump", filename=str(path.resolve()), format="png")
@@ -192,7 +217,7 @@ def boot(machine: Machine) -> str:
 
 def test() -> None:
     print(f"profile {PROFILE_NAME}: -machine {PROFILE['machine']}")
-    machine = Machine()
+    machine = Machine(keyboards=2)
     try:
         out = boot(machine)
         check("ROS kernel started, firmware exited" in out, "kernel took over from UEFI", out)
@@ -207,13 +232,44 @@ def test() -> None:
         out = machine.run("sysinfo")
         check(f"GICv{PROFILE['gic']}, distributor" in out and "PL011 UART" in out, "sysinfo shows hardware", out)
         out = machine.run("lsusb")
-        check("keyboard" in out, "lsusb lists the keyboard", out)
+        check(out.count(", keyboard") == 2, "lsusb lists both keyboards", out)
+        # QEMU sends key presses to one of the keyboards; unplug the second
+        # one so they must come through the first.
+        machine.command("device_del", id="kbd2")
+        time.sleep(1)
+        out = machine.run("echo typed on the first keyboard")
+        check("typed on the first keyboard" in out, "every keyboard on a controller works", out)
         out = machine.run("uptime")
         check("timer interrupts handled" in out, "timer interrupts are running", out)
         out = machine.run("brk")
         check("breakpoint hit" in out, "breakpoint exception is recovered", out)
         out = machine.run("nosuchcommand")
         check("command not found" in out, "unknown commands are reported", out)
+
+        # The serial terminal: line editing with escape sequences, UTF-8.
+        lines = machine.run_serial("echo abc" + LEFT + "X")
+        check("abXc" in lines, "serial: left arrow and insert in the middle", "\n".join(lines))
+        lines = machine.run_serial("echo xhello" + HOME + RIGHT * 5 + DELETE)
+        check("hello" in lines, "serial: home, right arrow and delete", "\n".join(lines))
+        lines = machine.run_serial(UP + UP)
+        check("abXc" in lines, "serial: up arrow recalls the history", "\n".join(lines))
+        lines = machine.run_serial("echo grüße")
+        check("grüße" in lines, "serial: UTF-8 input", "\n".join(lines))
+        start = len(machine.output)
+        machine.send("ls\t")
+        out = machine.wait_for(PROMPT + "ls", start)
+        check("lspci  lsusb" in out, "tab lists the matching commands", out)
+        machine.send(CTRL_C)
+        out = machine.wait_for(PROMPT, start + len(out))
+        check("^C" in out, "ctrl-c cancels the line", out)
+        start = len(machine.output)
+        machine.send("sleep 600\r")
+        time.sleep(1)
+        machine.send(CTRL_C)
+        out = machine.wait_for(PROMPT, start, timeout=30)
+        check("^C" in out and "slept" in out, "ctrl-c stops sleep", out)
+        out = machine.run("history")
+        check("echo abXc" in out and "sleep 600" in out, "history lists earlier commands", out)
 
         machine.type("shutdown\n")
         code = machine.proc.wait(timeout=TIMEOUT)

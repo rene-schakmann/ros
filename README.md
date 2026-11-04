@@ -7,7 +7,7 @@
 
 A tiny AArch64 operating system written in `no_std` Rust. It boots via UEFI in
 QEMU, VirtualBox or on a [Raspberry Pi 5](#raspberry-pi-5), greets you with a
-"HELLO RENE" banner and drops into a small shell. About 3,500 lines of heavily commented code, small enough to read in a
+"HELLO RENE" banner and drops into a small shell. About 4,800 lines of heavily commented code, small enough to read in a
 weekend.
 
 ![ROS booting to its shell](docs/screenshots/boot.png)
@@ -194,6 +194,7 @@ Linux.
 | `hello`          | show the welcome banner again                 |
 | `echo <text>`    | print text                                    |
 | `clear`          | clear the screen                              |
+| `history`        | list the commands typed so far                |
 | `sysinfo`        | CPU, timer, GIC, PCI, USB, screen overview    |
 | `time`           | date and time from the real-time clock        |
 | `uptime`         | time since boot and timer interrupts handled  |
@@ -206,8 +207,14 @@ Linux.
 | `panic`          | read an unmapped address to show the kernel panic screen |
 | `reboot`, `shutdown` | restart or power off through PSCI         |
 
-Keys: up/down = history, tab = complete the command, esc = clear the line.
-Typing on the serial console works too.
+Keys: up/down = history, left/right/home/end = move the cursor (type or delete
+anywhere in the line), tab = complete the command (twice: list the matches),
+esc = clear the line, ctrl-c = cancel the line or stop `sleep`, ctrl-l = clear
+the screen.
+
+Typing on the serial console works too, with the same keys (ROS decodes the
+escape sequences terminals send for them, and UTF-8). Colors are shown there as
+ANSI colors.
 
 ## How it works
 
@@ -245,6 +252,7 @@ more depth.
 
 - Own page tables: map the kernel and devices yourself, with guard pages.
 - Keyboard and USB interrupts via the GIC instead of polling.
+- USB hubs and hot-plugging (today a keyboard must be plugged in directly, at boot).
 - Processes: context switching on the timer tick, user mode (EL0), `svc`
   system calls.
 - Read files: a virtio-blk/virtio-scsi driver and a FAT32 reader for the boot disk.

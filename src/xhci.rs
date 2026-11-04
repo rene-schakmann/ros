@@ -220,7 +220,7 @@ pub struct UsbDevice {
     pub product: u16,
     /// Product name from the string descriptor (may be empty).
     pub name: String,
-    /// Whether ROS uses this device as its keyboard.
+    /// Whether ROS uses this device as a keyboard.
     pub is_keyboard: bool,
 }
 
@@ -245,7 +245,8 @@ pub struct Xhci {
     dcbaa: u64,
     commands: Ring,
     events: EventRing,
-    keyboard: Option<KeyboardEndpoint>,
+    /// Every boot keyboard on this controller, each with its endpoint.
+    keyboards: Vec<KeyboardEndpoint>,
     reports: VecDeque<[u8; 8]>,
     /// Interface version in BCD, e.g. 0x0110 for xHCI 1.1.
     pub version: u16,
@@ -344,7 +345,7 @@ impl Xhci {
                 dcbaa,
                 commands,
                 events: EventRing { base: segment, index: 0, cycle: 1, erdp: interrupter + 0x18 },
-                keyboard: None,
+                keyboards: Vec::new(),
                 reports: VecDeque::new(),
                 version,
                 devices: Vec::new(),
@@ -573,14 +574,6 @@ impl Xhci {
         let product = u16::from_le_bytes([desc[10], desc[11]]);
         let product_string = desc[15];
 
-        let name = if product_string != 0 {
-            self.get_descriptor(slot, &mut ep0, DESCRIPTOR_STRING, product_string as u16, buf, 255)
-                .map(|d| decode_string(&d))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
         // Configuration descriptor: first the header for the total length, then all of it.
         let head = self
             .get_descriptor(slot, &mut ep0, DESCRIPTOR_CONFIGURATION, 0, buf, 9)
@@ -613,6 +606,17 @@ impl Xhci {
             let _ = self.control(slot, &mut ep0, REQUEST_CLASS_INTERFACE, HID_SET_IDLE, 0, interface, 0, 0);
             self.start_keyboard(slot, port, speed, &kb)?;
         }
+
+        // The product name comes last: some devices reject (stall) string
+        // requests, which halts endpoint 0, and that must not stop the
+        // keyboard from working.
+        let name = if product_string != 0 {
+            self.get_descriptor(slot, &mut ep0, DESCRIPTOR_STRING, product_string as u16, buf, 255)
+                .map(|d| decode_string(&d))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         log!("usb: port {port} slot {slot}: {vendor:04x}:{product:04x} \"{name}\" {speed_name}");
         self.devices.push(UsbDevice {
@@ -670,32 +674,36 @@ impl Xhci {
         self.command(input, (TRB_CONFIGURE_ENDPOINT << 10) | ((slot as u32) << 24))
             .map_err(|_| "configure endpoint failed")?;
 
-        self.keyboard = Some(KeyboardEndpoint {
+        self.keyboards.push(KeyboardEndpoint {
             slot,
             dci,
             ring,
             buffer: alloc_page(),
             packet_size: kb.packet_size.clamp(8, 64) as u32,
         });
-        self.queue_keyboard_transfer();
+        self.queue_keyboard_transfer(self.keyboards.len() - 1);
         Ok(())
     }
 
-    /// Ask the keyboard for its next report.
-    fn queue_keyboard_transfer(&mut self) {
-        if let Some(kb) = self.keyboard.as_mut() {
-            kb.ring.push(kb.buffer, kb.packet_size, (TRB_NORMAL << 10) | IOC | ISP);
-            let (slot, dci) = (kb.slot, kb.dci);
-            self.ring_doorbell(slot, dci);
-        }
+    /// Ask keyboard number `index` for its next report.
+    fn queue_keyboard_transfer(&mut self, index: usize) {
+        let kb = &mut self.keyboards[index];
+        kb.ring.push(kb.buffer, kb.packet_size, (TRB_NORMAL << 10) | IOC | ISP);
+        let (slot, dci) = (kb.slot, kb.dci);
+        self.ring_doorbell(slot, dci);
     }
 
     /// If `event` is a keyboard report, queue it and return true.
     fn handle_keyboard_event(&mut self, event: &Trb) -> bool {
-        let Some(kb) = self.keyboard.as_ref() else { return false };
-        if event.kind() != TRB_TRANSFER_EVENT || event.slot() != kb.slot || event.endpoint() != kb.dci {
+        if event.kind() != TRB_TRANSFER_EVENT {
             return false;
         }
+        let Some(index) =
+            self.keyboards.iter().position(|kb| kb.slot == event.slot() && kb.dci == event.endpoint())
+        else {
+            return false;
+        };
+        let kb = &self.keyboards[index];
         if matches!(event.code(), SUCCESS | SHORT_PACKET) {
             let mut report = [0u8; 8];
             arch::dma_invalidate(kb.buffer, 8); // DMA: see the new report
@@ -705,7 +713,7 @@ impl Xhci {
         } else {
             log!("usb: keyboard transfer error {}", event.code());
         }
-        self.queue_keyboard_transfer();
+        self.queue_keyboard_transfer(index);
         true
     }
 
@@ -719,7 +727,7 @@ impl Xhci {
 
     /// Whether a boot keyboard was found and its endpoint is running.
     pub fn has_keyboard(&self) -> bool {
-        self.keyboard.is_some()
+        !self.keyboards.is_empty()
     }
 }
 
@@ -729,7 +737,8 @@ fn speed_info(speed: u8) -> (&'static str, u32) {
         1 => ("full speed (12 Mbit/s)", 8),
         2 => ("low speed (1.5 Mbit/s)", 8),
         3 => ("high speed (480 Mbit/s)", 64),
-        _ => ("super speed (5 Gbit/s)", 512),
+        4 => ("super speed (5 Gbit/s)", 512),
+        _ => ("super speed plus (10 Gbit/s)", 512),
     }
 }
 
@@ -848,5 +857,6 @@ mod tests {
         };
         assert_eq!((trb.kind(), trb.code(), trb.slot(), trb.endpoint()), (TRB_TRANSFER_EVENT, SUCCESS, 3, 5));
         assert_eq!(speed_info(3), ("high speed (480 Mbit/s)", 64));
+        assert_eq!(speed_info(5), ("super speed plus (10 Gbit/s)", 512));
     }
 }

@@ -5,7 +5,13 @@
 //! layout table decides which character a key produces. The report lists keys
 //! that are *currently held*; a key press is a key that wasn't there before.
 //!
-//! Reference: USB HID Usage Tables 1.5, chapter 10 ("Keyboard/Keypad Page").
+//! The serial console is a second keyboard. Terminals send plain bytes,
+//! UTF-8 for non-ASCII characters and ANSI escape sequences for special keys
+//! (`ESC [ A` is the up arrow); [`SerialDecoder`] turns those into the same
+//! [`Key`]s.
+//!
+//! References: USB HID Usage Tables 1.5, chapter 10 ("Keyboard/Keypad Page");
+//! ECMA-48 (control functions, the "ANSI" escape sequences).
 
 use crate::interrupts::uptime_ms;
 use crate::serial;
@@ -28,6 +34,11 @@ pub enum Key {
     Down,
     Left,
     Right,
+    Home,
+    End,
+    Delete,
+    /// A letter typed with Ctrl held, e.g. `Ctrl('c')`.
+    Ctrl(char),
 }
 
 /// Keyboard layout: which character each key position produces.
@@ -40,6 +51,7 @@ pub enum Layout {
 }
 
 // Modifier byte bits.
+const CTRL: u8 = 0x01 | 0x10; // left or right control
 const SHIFT: u8 = 0x02 | 0x20; // left or right shift
 const ALT_GR: u8 = 0x40; // right alt
 
@@ -51,6 +63,10 @@ const REPEAT_RATE_MS: u64 = 40;
 /// Usage ID reported in all six key slots when too many keys are pressed.
 const ERROR_ROLL_OVER: u8 = 0x01;
 
+/// A lone ESC byte is the Escape key, unless more bytes of an escape
+/// sequence follow within this time.
+const ESC_TIMEOUT_MS: u64 = 100;
+
 /// The running USB controllers (set up by `kernel_main`). A Raspberry Pi 5
 /// has two, each serving one USB 2 and one USB 3 port.
 pub static USB: Mutex<Vec<Xhci>> = Mutex::new(Vec::new());
@@ -61,6 +77,7 @@ struct State {
     held: [u8; 6],
     /// Key being held down for auto-repeat: (usage, key, next repeat time).
     repeat: Option<(u8, Key, u64)>,
+    serial: SerialDecoder,
     queue: VecDeque<Key>,
 }
 
@@ -79,32 +96,44 @@ pub fn layout() -> Layout {
 /// Next key press, if any. Never blocks.
 pub fn poll() -> Option<Key> {
     let mut state = STATE.lock();
-    for usb in USB.lock().iter_mut() {
-        while let Some(report) = usb.poll() {
-            state.on_report(&report);
-        }
-    }
-    // Serial input as a fallback, e.g. when no USB keyboard was found.
-    while let Some(byte) = serial::read_byte() {
-        state.queue.push_back(serial_key(byte));
-    }
-    state.on_tick(uptime_ms());
+    state.collect();
     state.queue.pop_front()
 }
 
-/// Translate a byte from the serial terminal.
-fn serial_key(byte: u8) -> Key {
-    match byte {
-        b'\r' | b'\n' => Key::Enter,
-        0x08 | 0x7f => Key::Backspace,
-        b'\t' => Key::Tab,
-        b => Key::Char(b as char),
-    }
+/// Whether Ctrl-C was pressed: removes it from the input queue, leaving the
+/// other keys for later. Lets long-running commands stop early.
+pub fn interrupted() -> bool {
+    let mut state = STATE.lock();
+    state.collect();
+    let position = state.queue.iter().position(|&k| k == Key::Ctrl('c'));
+    position.and_then(|i| state.queue.remove(i)).is_some()
 }
 
 impl State {
     const fn new() -> Self {
-        State { layout: Layout::Us, held: [0; 6], repeat: None, queue: VecDeque::new() }
+        State {
+            layout: Layout::Us,
+            held: [0; 6],
+            repeat: None,
+            serial: SerialDecoder::new(),
+            queue: VecDeque::new(),
+        }
+    }
+
+    /// Move new input from all keyboards into the queue.
+    fn collect(&mut self) {
+        for usb in USB.lock().iter_mut() {
+            while let Some(report) = usb.poll() {
+                self.on_report(&report);
+            }
+        }
+        // The serial terminal, e.g. `make qemu` or a USB-serial adapter.
+        let now = uptime_ms();
+        while let Some(byte) = serial::read_byte() {
+            self.serial.feed(byte, now, &mut self.queue);
+        }
+        self.serial.on_tick(now, &mut self.queue);
+        self.on_tick(now);
     }
 
     /// Auto-repeat the held key once its next repeat time `now` has come.
@@ -147,25 +176,173 @@ impl State {
     }
 }
 
+/// Turns bytes from a serial terminal into [`Key`]s.
+///
+/// Most bytes are characters, but three things need more than one byte:
+/// - escape sequences for special keys: `ESC [ A` (up), `ESC [ 3 ~` (delete),
+///   `ESC O H` (home, in some terminals' "application mode"), ...
+/// - UTF-8: `ü` arrives as the two bytes `0xc3 0xbc`.
+/// - the Escape key itself is a lone `ESC`, told apart from the start of a
+///   sequence by the pause after it ([`ESC_TIMEOUT_MS`]).
+#[derive(Debug)]
+struct SerialDecoder {
+    /// Bytes of an unfinished escape sequence or UTF-8 character.
+    pending: [u8; 8],
+    len: usize,
+    /// The escape sequence has more parameters than fit: ignore it.
+    overflow: bool,
+    /// When the pending ESC arrived.
+    esc_at: u64,
+}
+
+const ESC: u8 = 0x1b;
+
+impl SerialDecoder {
+    const fn new() -> Self {
+        SerialDecoder { pending: [0; 8], len: 0, overflow: false, esc_at: 0 }
+    }
+
+    /// Process one byte received at time `now`; finished keys go to `out`.
+    fn feed(&mut self, byte: u8, now: u64, out: &mut VecDeque<Key>) {
+        if self.len == 0 {
+            return self.start(byte, now, out);
+        }
+        if self.pending[0] == ESC {
+            self.feed_escape(byte, now, out);
+        } else {
+            self.feed_utf8(byte, now, out);
+        }
+    }
+
+    /// A byte that doesn't continue an earlier one.
+    fn start(&mut self, byte: u8, now: u64, out: &mut VecDeque<Key>) {
+        let key = match byte {
+            b'\r' | b'\n' => Key::Enter,
+            0x08 | 0x7f => Key::Backspace,
+            b'\t' => Key::Tab,
+            0x01..=0x1a => Key::Ctrl((b'a' + byte - 1) as char), // Ctrl-A .. Ctrl-Z
+            ESC | 0xc2..=0xf4 => {
+                // Start of an escape sequence or a multi-byte UTF-8 character.
+                self.pending[0] = byte;
+                self.len = 1;
+                self.esc_at = now;
+                return;
+            }
+            0x20..=0x7e => Key::Char(byte as char),
+            _ => return, // other control bytes, stray UTF-8 continuation bytes
+        };
+        out.push_back(key);
+    }
+
+    fn feed_escape(&mut self, byte: u8, now: u64, out: &mut VecDeque<Key>) {
+        if self.len == 1 {
+            if byte == b'[' || byte == b'O' {
+                self.push(byte);
+            } else {
+                // Not a sequence: the Escape key, then an ordinary byte.
+                self.len = 0;
+                out.push_back(Key::Escape);
+                self.start(byte, now, out);
+            }
+            return;
+        }
+        match byte {
+            // Parameter bytes, e.g. the "3" in `ESC [ 3 ~`.
+            0x30..=0x3f if self.len < self.pending.len() => self.push(byte),
+            0x30..=0x3f => self.overflow = true,
+            // Final byte: the sequence is complete.
+            0x40..=0x7e => {
+                let params = &self.pending[2..self.len];
+                if let Some(key) = escape_key(params, byte).filter(|_| !self.overflow) {
+                    out.push_back(key);
+                }
+                self.reset();
+            }
+            _ => self.reset(), // malformed: drop it
+        }
+    }
+
+    fn feed_utf8(&mut self, byte: u8, now: u64, out: &mut VecDeque<Key>) {
+        if byte & 0xc0 != 0x80 {
+            // Not a continuation byte: drop the broken character.
+            self.len = 0;
+            return self.start(byte, now, out);
+        }
+        self.push(byte);
+        let lead = self.pending[0];
+        let needed = if lead >= 0xf0 {
+            4
+        } else if lead >= 0xe0 {
+            3
+        } else {
+            2
+        };
+        if self.len == needed {
+            let c = core::str::from_utf8(&self.pending[..needed]).ok().and_then(|s| s.chars().next());
+            out.extend(c.map(Key::Char));
+            self.len = 0;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.len = 0;
+        self.overflow = false;
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.pending[self.len] = byte;
+        self.len += 1;
+    }
+
+    /// A lone ESC with nothing after it for a while is the Escape key.
+    fn on_tick(&mut self, now: u64, out: &mut VecDeque<Key>) {
+        if self.len == 1 && self.pending[0] == ESC && now >= self.esc_at + ESC_TIMEOUT_MS {
+            self.len = 0;
+            out.push_back(Key::Escape);
+        }
+    }
+}
+
+/// The key for a complete escape sequence `ESC [ <params> <last>` (or
+/// `ESC O <last>`), as xterm and most other terminals send them.
+fn escape_key(params: &[u8], last: u8) -> Option<Key> {
+    Some(match (params, last) {
+        (_, b'A') => Key::Up,
+        (_, b'B') => Key::Down,
+        (_, b'C') => Key::Right,
+        (_, b'D') => Key::Left,
+        (_, b'H') | (b"1" | b"7", b'~') => Key::Home,
+        (_, b'F') | (b"4" | b"8", b'~') => Key::End,
+        (b"3", b'~') => Key::Delete,
+        _ => return None,
+    })
+}
+
 /// Turn a key position (usage ID) plus modifiers into a [`Key`].
 fn translate(layout: Layout, usage: u8, modifiers: u8) -> Option<Key> {
     let shift = modifiers & SHIFT != 0;
     let alt_gr = modifiers & ALT_GR != 0;
+    let ctrl = modifiers & CTRL != 0;
     let key = match usage {
         0x28 | 0x58 => Key::Enter,
         0x29 => Key::Escape,
         0x2a => Key::Backspace,
         0x2b => Key::Tab,
+        0x4a => Key::Home,
+        0x4c => Key::Delete,
+        0x4d => Key::End,
         0x4f => Key::Right,
         0x50 => Key::Left,
         0x51 => Key::Down,
         0x52 => Key::Up,
+        // Keypad (always as digits: ROS doesn't track Num Lock).
+        0x54..=0x63 => Key::Char(b"/*-+\n1234567890."[(usage - 0x54) as usize] as char),
         _ => {
             let c = match layout {
                 Layout::Us => us(usage, shift),
                 Layout::De => de(usage, shift, alt_gr),
             }?;
-            Key::Char(c)
+            if ctrl && c.is_ascii_alphabetic() { Key::Ctrl(c.to_ascii_lowercase()) } else { Key::Char(c) }
         }
     };
     Some(key)
@@ -317,9 +494,67 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_keys_keypad_and_navigation() {
+        const LEFT_CTRL: u8 = 0x01;
+        assert_eq!(translate(Layout::Us, 0x06, LEFT_CTRL), Some(Key::Ctrl('c')));
+        assert_eq!(translate(Layout::Us, 0x06, LEFT_CTRL | LEFT_SHIFT), Some(Key::Ctrl('c')));
+        assert_eq!(translate(Layout::De, 0x1c, LEFT_CTRL), Some(Key::Ctrl('z'))); // Y position
+        assert_eq!(translate(Layout::Us, 0x1e, LEFT_CTRL), Some(Key::Char('1'))); // not a letter
+        assert_eq!(translate(Layout::Us, 0x59, 0), Some(Key::Char('1'))); // keypad 1
+        assert_eq!(translate(Layout::Us, 0x62, 0), Some(Key::Char('0'))); // keypad 0
+        assert_eq!(translate(Layout::Us, 0x57, 0), Some(Key::Char('+')));
+        assert_eq!(translate(Layout::Us, 0x58, 0), Some(Key::Enter)); // keypad enter
+        assert_eq!(translate(Layout::Us, 0x4a, 0), Some(Key::Home));
+        assert_eq!(translate(Layout::Us, 0x4c, 0), Some(Key::Delete));
+        assert_eq!(translate(Layout::Us, 0x4d, 0), Some(Key::End));
+    }
+
+    /// Feed `bytes` to a serial decoder at time 0 and return the keys.
+    fn decode(bytes: &[u8]) -> Vec<Key> {
+        let mut d = SerialDecoder::new();
+        let mut out = VecDeque::new();
+        for &b in bytes {
+            d.feed(b, 0, &mut out);
+        }
+        out.into_iter().collect()
+    }
+
+    #[test]
     fn serial_bytes() {
-        assert_eq!(serial_key(b'\r'), Key::Enter);
-        assert_eq!(serial_key(0x7f), Key::Backspace);
-        assert_eq!(serial_key(b'x'), Key::Char('x'));
+        assert_eq!(decode(b"a\r\x7f\t"), [Key::Char('a'), Key::Enter, Key::Backspace, Key::Tab]);
+        assert_eq!(decode(b"\x03\x0c"), [Key::Ctrl('c'), Key::Ctrl('l')]);
+        assert_eq!(decode(b"\x00\x1c"), []); // other control bytes are ignored
+    }
+
+    #[test]
+    fn serial_escape_sequences() {
+        assert_eq!(decode(b"\x1b[A\x1b[B\x1b[C\x1b[D"), [Key::Up, Key::Down, Key::Right, Key::Left]);
+        assert_eq!(decode(b"\x1b[H\x1b[F\x1bOH\x1bOF"), [Key::Home, Key::End, Key::Home, Key::End]);
+        assert_eq!(decode(b"\x1b[1~\x1b[4~\x1b[3~"), [Key::Home, Key::End, Key::Delete]);
+        assert_eq!(decode(b"\x1b[1;5C"), [Key::Right]); // Ctrl-Right: modifiers ignored
+        assert_eq!(decode(b"\x1b[15~x"), [Key::Char('x')]); // F5: unknown, dropped
+        assert_eq!(decode(b"\x1bx"), [Key::Escape, Key::Char('x')]); // not a sequence
+        assert_eq!(decode(b"\x1b[999999999A"), []); // too long: dropped
+    }
+
+    #[test]
+    fn serial_lone_escape_after_timeout() {
+        let mut d = SerialDecoder::new();
+        let mut out = VecDeque::new();
+        d.feed(ESC, 100, &mut out);
+        d.on_tick(100 + ESC_TIMEOUT_MS - 1, &mut out);
+        assert!(out.is_empty()); // could still be the start of a sequence
+        d.on_tick(100 + ESC_TIMEOUT_MS, &mut out);
+        assert_eq!(out.drain(..).collect::<Vec<_>>(), [Key::Escape]);
+        d.feed(b'[', 200, &mut out); // the sequence state was reset
+        assert_eq!(out.drain(..).collect::<Vec<_>>(), [Key::Char('[')]);
+    }
+
+    #[test]
+    fn serial_utf8() {
+        assert_eq!(decode("grüße €".as_bytes()), "grüße €".chars().map(Key::Char).collect::<Vec<_>>());
+        assert_eq!(decode("😀".as_bytes()), [Key::Char('😀')]);
+        assert_eq!(decode(b"\xc3a"), [Key::Char('a')]); // broken character dropped
+        assert_eq!(decode(b"\xbc"), []); // stray continuation byte
     }
 }

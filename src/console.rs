@@ -5,7 +5,9 @@
 //! To show text we copy each character's pixels from a bitmap font.
 //!
 //! Everything printed with [`print!`]/[`println!`]/[`cprint!`] also goes to the
-//! serial port, so the output is visible even without a screen.
+//! serial port, so the output is visible even without a screen. Colors and
+//! clearing the screen are sent there as ANSI escape sequences, which every
+//! terminal understands.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -172,7 +174,17 @@ impl Console {
         match c {
             '\n' => self.newline(),
             '\r' => self.col = 0,
-            '\x08' => self.col = self.col.saturating_sub(1),
+            // Backspace moves the cursor left without erasing; from the start
+            // of a row it goes back to the end of the previous one, so the
+            // line editor can move through a command that wrapped.
+            '\x08' => {
+                if self.col > 0 {
+                    self.col -= 1;
+                } else if self.row > 0 {
+                    self.row -= 1;
+                    self.col = self.cols - 1;
+                }
+            }
             '\t' => {
                 for _ in 0..4 - self.col % 4 {
                     self.put_char(' ');
@@ -267,6 +279,12 @@ pub unsafe fn init(fb: FrameBufferInfo) {
     *CONSOLE.lock() = Some(unsafe { Console::new(fb) });
 }
 
+/// Clear the screen, and the serial terminal too.
+pub fn clear() {
+    let _ = crate::serial::Serial.write_str("\x1b[2J\x1b[H"); // erase all, cursor home
+    with(Console::clear);
+}
+
 /// Run `f` on the console, if there is one.
 pub fn with<R>(f: impl FnOnce(&mut Console) -> R) -> Option<R> {
     CONSOLE.lock().as_mut().map(f)
@@ -278,10 +296,23 @@ pub fn _print(args: fmt::Arguments) {
     with(|c| c.write_fmt(args));
 }
 
+/// ANSI "select graphic rendition" code for a [`PALETTE`] color, e.g. 91
+/// for light red. The palette is in VGA order, ANSI swaps red and blue.
+fn ansi_color(rgb: u32) -> Option<u8> {
+    const VGA_TO_ANSI: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+    let i = PALETTE.iter().position(|&c| c == rgb)?;
+    Some(if i < 8 { 30 + VGA_TO_ANSI[i] } else { 90 + VGA_TO_ANSI[i - 8] })
+}
+
 /// Print in a given color, then switch back.
 #[doc(hidden)]
 pub fn _print_colored(rgb: u32, args: fmt::Arguments) {
-    let _ = crate::serial::Serial.write_fmt(args);
+    let mut serial = crate::serial::Serial;
+    let _ = match ansi_color(rgb) {
+        // 39 = the terminal's default color.
+        Some(code) => write!(serial, "\x1b[{code}m{args}\x1b[39m"),
+        None => serial.write_fmt(args),
+    };
     with(|c| {
         let old = c.fg();
         c.set_fg(rgb);
@@ -344,6 +375,31 @@ mod tests {
         assert_eq!(c.col, 4);
         c.write_str("x\x08").unwrap(); // wraps, then backspace
         assert_eq!((c.col, c.row), (0, 1));
+    }
+
+    #[test]
+    fn backspace_moves_back_across_wrapped_rows() {
+        let mut fb = Vec::new();
+        let mut c = console(4, 3, &mut fb);
+        c.write_str("abcdef").unwrap(); // "abcd" on row 0, "ef" on row 1
+        assert_eq!((c.col, c.row), (2, 1));
+        c.write_str("\x08\x08\x08").unwrap();
+        assert_eq!((c.col, c.row), (3, 0)); // on the "d"
+        c.write_str("D").unwrap(); // overwrite it; the wrap is deferred...
+        assert_eq!((c.col, c.row), (4, 0));
+        c.write_str("\x08").unwrap(); // ...so backspace stays on the row
+        assert_eq!((c.col, c.row), (3, 0));
+        c.write_str("\x08\x08\x08\x08").unwrap(); // stops at the top left
+        assert_eq!((c.col, c.row), (0, 0));
+    }
+
+    #[test]
+    fn palette_colors_map_to_ansi_codes() {
+        assert_eq!(ansi_color(color::LIGHT_RED), Some(91));
+        assert_eq!(ansi_color(color::LIGHT_BLUE), Some(94));
+        assert_eq!(ansi_color(color::CYAN), Some(36));
+        assert_eq!(ansi_color(color::GRAY), Some(90));
+        assert_eq!(ansi_color(0x123456), None);
     }
 
     #[test]

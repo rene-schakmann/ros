@@ -17,6 +17,8 @@ use alloc::vec::Vec;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Longest command line in characters.
 const LINE_MAX: usize = 200;
+/// Number of command lines kept in the history.
+const HISTORY_MAX: usize = 100;
 /// Cursor blink period in milliseconds (on for half of it).
 const CURSOR_BLINK_MS: u64 = 1000;
 
@@ -50,9 +52,8 @@ const COMMANDS: &[Command] = &[
     cmd("help", "", "show this list", |_, _| help()),
     cmd("hello", "", "show the welcome screen", |sh, _| sh.banner()),
     cmd("echo", "<text>", "print text", |_, arg| println!("{arg}")),
-    cmd("clear", "", "clear the screen", |_, _| {
-        console::with(|c| c.clear());
-    }),
+    cmd("clear", "", "clear the screen", |_, _| console::clear()),
+    cmd("history", "", "list the commands typed so far", |sh, _| sh.show_history()),
     cmd("sysinfo", "", "CPU and hardware overview", |sh, _| sh.sysinfo()),
     cmd("time", "", "date and time", |_, _| time()),
     cmd("uptime", "", "time since boot, timer interrupts", |_, _| uptime()),
@@ -77,12 +78,127 @@ fn split_command(line: &str) -> (&str, &str) {
     }
 }
 
-/// The single command name starting with `prefix`, if exactly one matches.
-fn complete(prefix: &str) -> Option<&'static str> {
-    let mut matches = COMMANDS.iter().map(|c| c.name).filter(|name| name.starts_with(prefix));
-    match (matches.next(), matches.next()) {
-        (Some(only), None) => Some(only),
-        _ => None,
+/// The command names starting with `prefix`, and the longest prefix they
+/// all share (what tab can safely fill in).
+fn complete(prefix: &str) -> (Vec<&'static str>, &'static str) {
+    let matches: Vec<&'static str> =
+        COMMANDS.iter().map(|c| c.name).filter(|n| n.starts_with(prefix)).collect();
+    let common = matches.iter().fold(matches.first().copied().unwrap_or(""), |common, name| {
+        let shared = common.bytes().zip(name.bytes()).take_while(|(a, b)| a == b).count();
+        &common[..shared]
+    });
+    (matches, common)
+}
+
+/// `n` backspaces: moves the cursor `n` characters left without erasing.
+fn back(n: usize) -> String {
+    "\x08".repeat(n)
+}
+
+/// The command line being edited: its characters and the cursor position.
+///
+/// Every edit returns the text to print so that the screen (and a serial
+/// terminal) shows the new line with the cursor in the right place. A
+/// backspace character moves the cursor one position left, so an insertion
+/// in the middle prints the new character plus the rest of the line, then
+/// moves back.
+#[derive(Debug, Default)]
+struct LineEditor {
+    chars: Vec<char>,
+    cursor: usize,
+}
+
+impl LineEditor {
+    fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    fn len(&self) -> usize {
+        self.chars.len()
+    }
+
+    fn at_end(&self) -> bool {
+        self.cursor == self.chars.len()
+    }
+
+    /// The characters from the cursor to the end of the line.
+    fn tail(&self) -> String {
+        self.chars[self.cursor..].iter().collect()
+    }
+
+    fn insert(&mut self, s: &str) -> String {
+        let mut out = String::new();
+        for c in s.chars() {
+            self.chars.insert(self.cursor, c);
+            self.cursor += 1;
+            out.push(c);
+        }
+        let tail = self.tail();
+        out + &tail + &back(tail.chars().count())
+    }
+
+    /// Delete the character left of the cursor.
+    fn backspace(&mut self) -> String {
+        if self.cursor == 0 {
+            return String::new();
+        }
+        self.cursor -= 1;
+        self.chars.remove(self.cursor);
+        alloc::format!("\x08{}", self.redraw_tail())
+    }
+
+    /// Delete the character under the cursor.
+    fn delete(&mut self) -> String {
+        if self.at_end() {
+            return String::new();
+        }
+        self.chars.remove(self.cursor);
+        self.redraw_tail()
+    }
+
+    /// After a deletion: print the rest of the line, blank the now unused
+    /// last cell and move back to the cursor.
+    fn redraw_tail(&self) -> String {
+        let tail = self.tail();
+        let n = tail.chars().count() + 1;
+        tail + " " + &back(n)
+    }
+
+    fn left(&mut self) -> String {
+        if self.cursor == 0 {
+            return String::new();
+        }
+        self.cursor -= 1;
+        back(1)
+    }
+
+    fn right(&mut self) -> String {
+        let Some(&c) = self.chars.get(self.cursor) else { return String::new() };
+        self.cursor += 1;
+        String::from(c)
+    }
+
+    fn home(&mut self) -> String {
+        let n = self.cursor;
+        self.cursor = 0;
+        back(n)
+    }
+
+    fn end(&mut self) -> String {
+        let tail = self.tail();
+        self.cursor = self.chars.len();
+        tail
+    }
+
+    /// Replace the whole line, e.g. with a history entry.
+    fn set(&mut self, new: &str) -> String {
+        let old_len = self.chars.len();
+        let mut out = self.home();
+        self.chars = new.chars().collect();
+        self.cursor = self.chars.len();
+        out.push_str(new);
+        let leftover = old_len.saturating_sub(self.chars.len());
+        out + &" ".repeat(leftover) + &back(leftover)
     }
 }
 
@@ -108,6 +224,9 @@ impl Shell {
             let line = self.read_line();
             let line = line.trim();
             if !line.is_empty() && self.history.last().map(String::as_str) != Some(line) {
+                if self.history.len() == HISTORY_MAX {
+                    self.history.remove(0);
+                }
                 self.history.push(String::from(line));
             }
             self.execute(line);
@@ -136,45 +255,74 @@ impl Shell {
         console::with(|c| c.set_bold(false));
     }
 
-    /// Line editor: typing, backspace, history (up/down), tab completion.
+    /// Read a command line: typing and editing, history (up/down) and tab completion.
     fn read_line(&mut self) -> String {
-        let mut line = String::new();
+        let mut line = LineEditor::default();
         let mut history_pos = self.history.len();
         loop {
-            match wait_key() {
+            let out = match wait_key() {
                 Key::Enter => {
-                    println!();
-                    return line;
+                    print!("{}\n", line.end());
+                    return line.text();
                 }
-                Key::Backspace => {
-                    if line.pop().is_some() {
-                        print!("\x08 \x08");
-                    }
+                Key::Ctrl('c') => {
+                    print!("{}^C\n", line.end());
+                    return String::new();
                 }
-                Key::Escape => replace_line(&mut line, ""),
+                Key::Ctrl('l') => {
+                    console::clear();
+                    self.prompt();
+                    let text = line.text();
+                    alloc::format!("{text}{}", back(line.len() - line.cursor))
+                }
+                Key::Backspace => line.backspace(),
+                Key::Delete => line.delete(),
+                Key::Left => line.left(),
+                Key::Right => line.right(),
+                Key::Home | Key::Ctrl('a') => line.home(),
+                Key::End | Key::Ctrl('e') => line.end(),
+                Key::Escape => line.set(""),
                 Key::Up if history_pos > 0 => {
                     history_pos -= 1;
-                    replace_line(&mut line, &self.history[history_pos]);
+                    line.set(&self.history[history_pos])
                 }
                 Key::Down if history_pos < self.history.len() => {
                     history_pos += 1;
-                    let entry = self.history.get(history_pos).map(String::as_str).unwrap_or("");
-                    replace_line(&mut line, entry);
+                    line.set(self.history.get(history_pos).map(String::as_str).unwrap_or(""))
                 }
-                Key::Tab => {
-                    if let Some(only) = complete(&line) {
-                        let rest = &only[line.len()..];
-                        print!("{rest} ");
-                        line.push_str(rest);
-                        line.push(' ');
-                    }
+                // Only the command name is completed (no arguments yet).
+                Key::Tab if line.at_end() && !line.text().contains(' ') => self.tab(&mut line),
+                Key::Char(c) if !c.is_control() && line.len() < LINE_MAX => {
+                    line.insert(c.encode_utf8(&mut [0; 4]))
                 }
-                Key::Char(c) if !c.is_control() && line.chars().count() < LINE_MAX => {
-                    line.push(c);
-                    print!("{c}");
-                }
-                _ => {}
+                _ => String::new(),
+            };
+            print!("{out}");
+        }
+    }
+
+    /// Tab: complete a unique command, fill in the shared part of several,
+    /// or list them all if there is nothing to fill in.
+    fn tab(&self, line: &mut LineEditor) -> String {
+        let text = line.text();
+        let (matches, common) = complete(&text);
+        match matches.as_slice() {
+            [] => String::new(),
+            [only] => line.insert(&alloc::format!("{} ", &only[text.len()..])),
+            _ if common.len() > text.len() => line.insert(&common[text.len()..]),
+            _ => {
+                println!();
+                cprint!(color::LIGHT_CYAN, "{}\n", matches.join("  "));
+                self.prompt();
+                text
             }
+        }
+    }
+
+    fn show_history(&self) {
+        for (i, line) in self.history.iter().enumerate() {
+            cprint!(color::GRAY, "{:>4}  ", i + 1);
+            println!("{line}");
         }
     }
 
@@ -270,15 +418,6 @@ fn wait_key() -> Key {
     }
 }
 
-fn replace_line(line: &mut String, new: &str) {
-    for _ in 0..line.chars().count() {
-        print!("\x08 \x08");
-    }
-    line.clear();
-    line.push_str(new);
-    print!("{new}");
-}
-
 fn help() {
     println!("Commands:");
     for c in COMMANDS {
@@ -287,7 +426,8 @@ fn help() {
         cprint!(color::LIGHT_CYAN, "  {usage:<14}");
         println!("{}", c.help);
     }
-    cprint!(color::GRAY, "Keys: up/down = history, tab = complete, esc = clear line\n");
+    cprint!(color::GRAY, "Keys: up/down = history, left/right/home/end = move, tab = complete,\n");
+    cprint!(color::GRAY, "      esc = clear line, ctrl-c = cancel, ctrl-l = clear screen\n");
 }
 
 fn time() {
@@ -321,12 +461,16 @@ fn sleep(arg: &str) {
     let Some(ms) = arg.parse::<u64>().ok().and_then(|secs| secs.checked_mul(1000)) else {
         return println!("usage: sleep <seconds>");
     };
-    let secs = ms / 1000;
     let (start, ticks) = (uptime_ms(), interrupts::ticks());
     while uptime_ms() < start.saturating_add(ms) {
+        if keyboard::interrupted() {
+            println!("^C");
+            break;
+        }
         arch::wait_for_interrupt();
     }
-    println!("slept {secs}s, woke up {} times by the timer", interrupts::ticks() - ticks);
+    let slept = format_duration(uptime_ms() - start);
+    println!("slept {slept}, woke up {} times by the timer", interrupts::ticks() - ticks);
 }
 
 /// Human-readable size: "12 MiB" or "348 KiB".
@@ -446,6 +590,7 @@ fn set_layout(arg: &str) {
 mod tests {
     use super::*;
     use crate::memory::Region;
+    use alloc::vec;
 
     #[test]
     fn splits_command_lines() {
@@ -455,11 +600,59 @@ mod tests {
     }
 
     #[test]
-    fn completes_unique_prefixes() {
-        assert_eq!(complete("sys"), Some("sysinfo"));
-        assert_eq!(complete("ls"), None); // lspci and lsusb
-        assert_eq!(complete("lsu"), Some("lsusb"));
-        assert_eq!(complete("xyz"), None);
+    fn completes_command_names() {
+        assert_eq!(complete("sys"), (vec!["sysinfo"], "sysinfo"));
+        assert_eq!(complete("ls"), (vec!["lspci", "lsusb"], "ls"));
+        assert_eq!(complete("he"), (vec!["help", "hello"], "hel"));
+        assert_eq!(complete("lsu"), (vec!["lsusb"], "lsusb"));
+        assert_eq!(complete("xyz"), (vec![], ""));
+    }
+
+    /// Apply `steps` to a fresh editor and return what the terminal shows
+    /// (interpreting backspace as "cursor left"), the text and the cursor.
+    fn edit(steps: &[&dyn Fn(&mut LineEditor) -> String]) -> (String, String, usize) {
+        let mut line = LineEditor::default();
+        let mut screen: Vec<char> = Vec::new();
+        let mut pos = 0;
+        for step in steps {
+            for c in step(&mut line).chars() {
+                if c == '\x08' {
+                    pos -= 1;
+                } else {
+                    if pos == screen.len() {
+                        screen.push(c);
+                    } else {
+                        screen[pos] = c;
+                    }
+                    pos += 1;
+                }
+            }
+            assert_eq!(pos, line.cursor, "screen cursor and editor cursor disagree");
+        }
+        (screen.iter().collect::<String>().trim_end().into(), line.text(), line.cursor)
+    }
+
+    #[test]
+    fn line_editor_inserts_and_deletes_in_the_middle() {
+        let (screen, text, cursor) = edit(&[
+            &|l| l.insert("echo ac"),
+            &|l| l.left(),
+            &|l| l.insert("b"), // echo abc
+            &|l| l.home(),
+            &|l| l.delete(), // cho abc
+            &|l| l.end(),
+            &|l| l.backspace(), // cho ab
+            &|l| l.right(),     // at the end already: no-op
+        ]);
+        assert_eq!((screen.as_str(), text.as_str(), cursor), ("cho ab", "cho ab", 6));
+    }
+
+    #[test]
+    fn line_editor_replaces_the_line() {
+        let (screen, text, cursor) = edit(&[&|l| l.insert("sysinfo"), &|l| l.left(), &|l| l.set("mem")]);
+        assert_eq!((screen.as_str(), text.as_str(), cursor), ("mem", "mem", 3));
+        let (_, _, cursor) = edit(&[&|l| l.left(), &|l| l.backspace(), &|l| l.delete()]);
+        assert_eq!(cursor, 0); // nothing to do on an empty line
     }
 
     #[test]

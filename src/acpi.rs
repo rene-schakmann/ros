@@ -10,6 +10,10 @@
 //! byte slice of its declared length; everything after that is bounds-checked
 //! slice parsing (and unit-tested on the host).
 //!
+//! Every table carries a checksum: all its bytes add up to 0 (mod 256). A
+//! wrong checksum means a firmware bug or corrupted memory. Like Linux, ROS
+//! reports it but still uses the table: refusing to boot would not help.
+//!
 //! Reference: ACPI Specification 6.5, chapter 5.2 ("ACPI System Description Tables").
 
 use crate::interrupts::Gic;
@@ -65,6 +69,8 @@ pub struct Platform {
     /// Raspberry Pi 5: where the firmware mapped the RP1 I/O chip's
     /// peripheral BAR (patched into the DSDT as `PBAR`).
     pub rp1_bar: Option<u64>,
+    /// Signature of the first table with a wrong checksum, if any.
+    pub bad_checksum: Option<[u8; 4]>,
 }
 
 impl Platform {
@@ -178,6 +184,17 @@ fn u64_at(b: &[u8], off: usize) -> Option<u64> {
     le(b, off).map(u64::from_le_bytes)
 }
 
+/// Whether all bytes of `bytes` add up to 0 (mod 256), as ACPI requires.
+fn checksum_ok(bytes: &[u8]) -> bool {
+    bytes.iter().fold(0u8, |sum, &b| sum.wrapping_add(b)) == 0
+}
+
+/// The RSDP has two checksums: one over the ACPI 1.0 part (20 bytes) and
+/// one over the whole ACPI 2.0 structure (36 bytes).
+fn rsdp_checksum_ok(rsdp: &[u8]) -> bool {
+    rsdp.len() >= 36 && checksum_ok(&rsdp[..20]) && checksum_ok(&rsdp[..36])
+}
+
 /// View the ACPI table at physical address `addr` as a byte slice of the
 /// length declared in its header.
 ///
@@ -215,11 +232,22 @@ pub unsafe fn parse(rsdp: u64) -> Result<Platform, Error> {
     }
 
     let mut p = Platform { timer_irq: DEFAULT_TIMER_IRQ, psci_hvc: true, ..Default::default() };
+    // Remember the first table whose checksum is wrong.
+    let check = |t: &[u8], p: &mut Platform| {
+        if !checksum_ok(t) && p.bad_checksum.is_none() {
+            p.bad_checksum = t.first_chunk::<4>().copied();
+        }
+    };
+    if !rsdp_checksum_ok(rsdp) {
+        p.bad_checksum = Some(*b"RSDP");
+    }
+    check(xsdt, &mut p);
     // The XSDT body is a list of 64-bit pointers to all other tables.
     for entry in xsdt[HEADER_LEN..].as_chunks::<8>().0 {
         let addr = u64::from_le_bytes(*entry);
         // SAFETY: every XSDT entry points to a valid table.
         let t = unsafe { table(addr) };
+        check(t, &mut p);
         match &t[..4] {
             b"MCFG" => parse_mcfg(t, &mut p),
             b"APIC" => parse_madt(t, &mut p),
@@ -229,7 +257,9 @@ pub unsafe fn parse(rsdp: u64) -> Result<Platform, Error> {
                 let dsdt = parse_fadt(t, &mut p);
                 if let Some(dsdt) = dsdt.filter(|&a| a != 0) {
                     // SAFETY: the FADT's X_DSDT field points to the valid DSDT.
-                    parse_dsdt(unsafe { table(dsdt) }, &mut p);
+                    let dsdt = unsafe { table(dsdt) };
+                    check(dsdt, &mut p);
+                    parse_dsdt(dsdt, &mut p);
                 }
             }
             _ => {}
@@ -364,6 +394,31 @@ mod tests {
         assert_eq!(u16_at(&b, 3), Some(0xff12));
         assert_eq!(u32_at(&b, 2), None);
         assert_eq!(u64_at(&b, usize::MAX), None);
+    }
+
+    /// Set byte 9 (the header's checksum field) so the table sums to 0.
+    fn fix_checksum(t: &mut [u8]) {
+        t[9] = 0;
+        t[9] = 0u8.wrapping_sub(t.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+    }
+
+    #[test]
+    fn validates_checksums() {
+        let mut t = table_with(b"APIC", 44);
+        t[40] = 0x5a;
+        assert!(!checksum_ok(&t));
+        fix_checksum(&mut t);
+        assert!(checksum_ok(&t));
+
+        let mut rsdp = vec![0u8; 36];
+        rsdp[..8].copy_from_slice(b"RSD PTR ");
+        rsdp[8] = 0u8.wrapping_sub(rsdp[..20].iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+        assert!(rsdp_checksum_ok(&rsdp));
+        rsdp[30] = 1; // only covered by the extended checksum
+        assert!(!rsdp_checksum_ok(&rsdp));
+        rsdp[32] = 0xff; // extended checksum field
+        assert!(rsdp_checksum_ok(&rsdp));
+        assert!(!rsdp_checksum_ok(&rsdp[..20]));
     }
 
     #[test]
